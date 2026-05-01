@@ -270,7 +270,11 @@ async def cmd_reset(message: Message) -> None:
     bot = message.bot
     assert bot is not None
     sess = get_or_create_session(message.chat.id, bot)
-    # Tell the user we're working — the compact-before-wipe takes a few seconds.
+    # If there's an active Claude turn, ask it to cancel. Without this,
+    # `await sess.reset()` would queue behind the turn's lock and the
+    # user perceives the bot as frozen until the turn finishes
+    # (sometimes minutes for runaway browser tests).
+    sess.request_cancel()
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     saved_title = await sess.reset()
     if saved_title:

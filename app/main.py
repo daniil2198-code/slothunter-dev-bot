@@ -23,7 +23,18 @@ async def amain() -> None:
 
     scheduler.start()
     try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+        # ``handle_as_tasks=True`` runs every update in its own asyncio
+        # task instead of awaiting them sequentially. Without this, a
+        # long-running Claude turn (3+ minutes is normal for browser
+        # tests) would block ``/reset`` and ``/cancel`` updates from
+        # ever reaching their handlers — the user is locked out until
+        # the turn finishes. With the flag, control commands always
+        # respond even mid-turn.
+        await dp.start_polling(
+            bot,
+            allowed_updates=["message", "callback_query"],
+            handle_as_tasks=True,
+        )
     finally:
         scheduler.shutdown(wait=False)
         await bot.session.close()
