@@ -50,7 +50,23 @@ if ! cmp -s "$UNIT_SRC" "$UNIT_DST"; then
   systemctl daemon-reload
 fi
 
-# ─────────── 6. Restart ───────────
+# ─────────── 6. Pre-flight: claude /login ───────────
+# The bot can't run unless the local claude CLI is authed against
+# claude.ai. We don't try to (re)login here — that needs an interactive
+# browser. But we refuse to start the service if the auth is missing,
+# else systemd will tight-loop on a permanent failure.
+if ! claude --version >/dev/null 2>&1; then
+  log "ERROR: claude CLI not on PATH"
+  exit 1
+fi
+if [ ! -d /root/.claude ] || ! find /root/.claude -name '*.json' -size +0 -print -quit | grep -q .; then
+  log "ERROR: ~/.claude/ has no auth state."
+  log "  Run interactively: tmux new -s login → claude → /login"
+  log "  Then re-run this deploy script."
+  exit 1
+fi
+
+# ─────────── 7. Restart ───────────
 log "restarting ${SERVICE}..."
 systemctl enable "$SERVICE" >/dev/null
 systemctl restart "$SERVICE"
