@@ -818,19 +818,20 @@ async def _send_reply(bot: Bot, chat_id: int, reply: StreamedReply) -> None:
             log.debug("auto_send_image_failed", path=str(path), error=str(e))
 
 
-# Image-path regex. Two flavors:
+# Image-path regex. Three flavors:
 # 1) absolute paths under common screenshot roots (/tmp, ~/.cache/...);
-# 2) any ``.playwright-mcp/<file>`` mention — Playwright MCP writes there
-#    relative to its cwd (which is wherever the dev-bot started, usually
-#    /opt/slothunter-dev-bot). We resolve relative paths against the
-#    project root before checking existence.
+# 2) ``.playwright-mcp/<file>`` — Playwright MCP's default output dir;
+# 3) bare ``screenshot-<name>.png`` or ``./screenshot-...`` — what
+#    Claude often writes when asking for a "filename" with no path.
+#    Restricted to the ``screenshot-`` prefix so we don't accidentally
+#    pick up arbitrary png mentions in code blocks ("button.png" etc).
 #
-# We DON'T match arbitrary "*.png" anywhere in text — that would catch
-# code-snippet asset references and spam the chat.
+# All relative forms get resolved against known project roots before
+# we check existence on disk.
 _ABS_IMAGE_PATH_RE = re.compile(
     r"(?<![\w/])"  # no leading word char or slash before
     r"(/(?:tmp|var/lib/slothunter-dev-bot|root/\.cache/playwright-mcp|"
-    r"home/[^/\s]+/screenshots|opt/[^/\s]+/\.playwright-mcp)"
+    r"home/[^/\s]+/screenshots|opt/[^/\s]+/\.playwright-mcp|opt/[^/\s]+)"
     r"/[^\s\"'<>`]+\.(?:png|jpg|jpeg|webp))",
     re.IGNORECASE,
 )
@@ -841,13 +842,21 @@ _REL_PLAYWRIGHT_RE = re.compile(
     r"(\.playwright-mcp/[^\s\"'<>`]+\.(?:png|jpg|jpeg|webp))",
     re.IGNORECASE,
 )
+# Bare or ./-prefixed screenshot file. Conservative: require the
+# ``screenshot-`` prefix so we don't suck in random ``logo.png``
+# mentions Claude might quote from code.
+_BARE_SCREENSHOT_RE = re.compile(
+    r"(?<![\w/])"
+    r"\.?/?(screenshot-[^\s\"'<>`/]+\.(?:png|jpg|jpeg|webp))",
+    re.IGNORECASE,
+)
 
-# Search roots for resolving Playwright MCP relative paths. We try the
-# project root first (where the bot was launched), then a couple of
-# common alternates.
-_PLAYWRIGHT_ROOTS = (
-    Path("/opt/slothunter-dev-bot"),
+# Search roots for resolving relative paths. We try the project root
+# first (where the bot was launched), then a couple of common
+# alternates. Order matters: first hit wins.
+_RELATIVE_SEARCH_ROOTS = (
     Path("/opt/slot-hunter"),
+    Path("/opt/slothunter-dev-bot"),
     Path.cwd(),
 )
 
@@ -855,9 +864,9 @@ _PLAYWRIGHT_ROOTS = (
 def _extract_image_paths(text: str) -> list[Path]:
     """Find screenshot paths Claude mentioned and that exist on disk.
 
-    Both absolute paths (under whitelisted dirs) and relative
-    ``.playwright-mcp/...`` paths are recognized. The latter are resolved
-    against known project roots — Playwright MCP writes there by default.
+    Recognises absolute paths, ``.playwright-mcp/...`` relatives, and
+    bare ``screenshot-*.png`` mentions. Relative forms are resolved
+    against known project roots.
 
     Caps at 5 to prevent runaway output from spamming the chat.
     """
@@ -866,26 +875,42 @@ def _extract_image_paths(text: str) -> list[Path]:
     seen: set[str] = set()
     out: list[Path] = []
 
+    def _push(p: Path) -> bool:
+        """Append if file exists; return True if we should stop."""
+        if not p.is_file():
+            return False
+        out.append(p)
+        return len(out) >= 5
+
     for match in _ABS_IMAGE_PATH_RE.findall(text):
         if match in seen:
             continue
         seen.add(match)
-        path = Path(match)
-        if path.is_file():
-            out.append(path)
-            if len(out) >= 5:
-                return out
+        if _push(Path(match)):
+            return out
 
     for match in _REL_PLAYWRIGHT_RE.findall(text):
         if match in seen:
             continue
         seen.add(match)
-        for root in _PLAYWRIGHT_ROOTS:
-            candidate = root / match
-            if candidate.is_file():
-                out.append(candidate)
-                if len(out) >= 5:
-                    return out
+        for root in _RELATIVE_SEARCH_ROOTS:
+            if _push(root / match):
+                return out
+            if (root / match).is_file():
+                break  # already pushed inside _push, no need to try other roots
+
+    for match in _BARE_SCREENSHOT_RE.findall(text):
+        # Skip if this filename was already captured as part of an
+        # absolute / .playwright-mcp match above.
+        if any(match in s for s in seen):
+            continue
+        if match in seen:
+            continue
+        seen.add(match)
+        for root in _RELATIVE_SEARCH_ROOTS:
+            if _push(root / match):
+                return out
+            if (root / match).is_file():
                 break
 
     return out
