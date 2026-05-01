@@ -1,4 +1,4 @@
-"""Entrypoint — long-poll Telegram, dispatch to handlers."""
+"""Entrypoint — long-poll Telegram, dispatch to handlers, run scheduler."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import contextlib
 
 from app.bot import build_bot, build_dispatcher
 from app.logging import configure_logging, get_logger
+from app.scheduler import build_scheduler
 
 
 async def amain() -> None:
@@ -15,13 +16,16 @@ async def amain() -> None:
 
     bot = build_bot()
     dp = build_dispatcher()
+    scheduler = build_scheduler(bot)
 
     me = await bot.get_me()
     log.info("bot_started", username=me.username, id=me.id)
 
+    scheduler.start()
     try:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
+        scheduler.shutdown(wait=False)
         await bot.session.close()
 
 

@@ -5,6 +5,7 @@ description = "Telegram-bot wrapper around Claude Code — single-user remote de
 requires-python = ">=3.12"
 dependencies = [
     "aiogram>=3.13.0",
+    "apscheduler>=3.11.2",
     "claude-agent-sdk>=0.1.0",
     "pydantic-settings>=2.6.0",
     "structlog>=25.0.0",
@@ -28,6 +29,10 @@ strict = true
 
 [[tool.mypy.overrides]]
 module = "claude_agent_sdk.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "apscheduler.*"
 ignore_missing_imports = true
 
 [dependency-groups]

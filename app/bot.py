@@ -86,6 +86,7 @@ async def cmd_help(message: Message) -> None:
     text = (
         "<b>Команды</b>\n\n"
         "<code>/menu</code>    — inline-клавиатура быстрых действий\n"
+        "<code>/digest</code>  — утренний дайджест (commits, ROADMAP, прод, ошибки)\n"
         "<code>/status</code>  — текущая папка, session id, модель, betas\n"
         "<code>/reset</code>   — забыть разговор, следующее сообщение начнёт с чистого\n"
         "<code>/compact</code> — ужать историю в summary, контекст продолжается\n"
@@ -141,6 +142,24 @@ async def cmd_cancel(message: Message) -> None:
     sess = get_or_create_session(message.chat.id, message.bot)  # type: ignore[arg-type]
     sess.request_cancel()
     await message.answer("⏹ Прерываю — придёт результат того, что успел.")
+
+
+@router.message(Command("digest"))
+async def cmd_digest(message: Message) -> None:
+    """Trigger the morning digest on demand. Same renderer as the cron
+    job — useful for verifying things look right without waiting for
+    9 AM."""
+    bot = message.bot
+    assert bot is not None
+    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    try:
+        from app.digest import build_digest_html
+
+        text = await build_digest_html()
+    except Exception as e:  # noqa: BLE001
+        await message.answer(f"⚠️ Дайджест упал: {html.escape(str(e))}")
+        return
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("compact"))

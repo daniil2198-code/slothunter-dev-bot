@@ -46,9 +46,20 @@ class Settings(BaseSettings):
     # window for Opus is gated behind ``context-1m-2025-08-07``.
     claude_betas: str = ""
 
+    # ─────── Daily digest (M1) ───────
+    # ``HH:MM`` in Europe/Minsk; empty disables the cron job entirely.
+    digest_time: str = ""
+    digest_repo: Path = Path("/opt/slot-hunter")
+    digest_healthz: str = ""
+    digest_log_units: str = ""
+
     @property
     def betas(self) -> list[str]:
         return [b.strip() for b in self.claude_betas.split(",") if b.strip()]
+
+    @property
+    def digest_log_units_list(self) -> list[str]:
+        return [u.strip() for u in self.digest_log_units.split(",") if u.strip()]
 
 
 @lru_cache(maxsize=1)
