@@ -34,6 +34,12 @@ from typing import Any
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from claude_agent_sdk.types import (
+    PermissionResult,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ToolPermissionContext,
+)
 
 from app.logging import get_logger
 
@@ -309,26 +315,31 @@ class PermissionBroker:
 # ─────────── can_use_tool callback factory ───────────
 
 
-CanUseToolCallback = Callable[[str, dict[str, Any], Any], Awaitable[dict[str, Any]]]
+CanUseToolCallback = Callable[
+    [str, dict[str, Any], ToolPermissionContext],
+    Awaitable[PermissionResult],
+]
 
 
 def make_can_use_tool(broker: PermissionBroker) -> CanUseToolCallback:
     """Return a ``can_use_tool`` async callback bound to this broker.
 
     Signature comes from ``claude_agent_sdk``: receives the tool name,
-    input dict, and a context object; returns a dict with ``behavior``
-    set to either ``allow`` or ``deny`` (with optional ``message``).
+    input dict, and a ``ToolPermissionContext``; must return a
+    ``PermissionResultAllow`` or ``PermissionResultDeny`` instance.
+    Older SDKs accepted plain dicts here — the new API requires the
+    typed dataclasses, otherwise every tool-use silently errors out.
     """
 
     async def callback(
         tool_name: str,
         tool_input: dict[str, Any],
-        context: Any,  # noqa: ARG001 — not currently inspected
-    ) -> dict[str, Any]:
+        context: ToolPermissionContext,  # noqa: ARG001 — not currently inspected
+    ) -> PermissionResult:
         # AUTO_TOOLS shouldn't reach here (pre-allowed via allowed_tools)
         # but we double-belt-check.
         if tool_name in AUTO_TOOLS:
-            return {"behavior": "allow", "updatedInput": tool_input}
+            return PermissionResultAllow(updated_input=tool_input)
 
         # Smart Bash: read-only / inspect commands skip the prompt.
         # Cuts ~80% of approval taps when working over Telegram.
@@ -336,15 +347,15 @@ def make_can_use_tool(broker: PermissionBroker) -> CanUseToolCallback:
             cmd = str(tool_input.get("command", ""))
             if is_safe_bash(cmd):
                 log.info("bash_auto_approved", command=cmd[:120])
-                return {"behavior": "allow", "updatedInput": tool_input}
+                return PermissionResultAllow(updated_input=tool_input)
 
         allowed, reason = await broker.request(tool_name, tool_input)
         if allowed:
-            return {"behavior": "allow", "updatedInput": tool_input}
-        return {
-            "behavior": "deny",
-            "message": reason or "Отклонено пользователем",
-        }
+            return PermissionResultAllow(updated_input=tool_input)
+        return PermissionResultDeny(
+            message=reason or "Отклонено пользователем",
+            interrupt=False,
+        )
 
     return callback
 

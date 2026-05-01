@@ -53,6 +53,15 @@ class Settings(BaseSettings):
     digest_healthz: str = ""
     digest_log_units: str = ""
 
+    # ─────── Voice transcription via Groq Whisper (M1.5) ───────
+    # Empty key disables voice handling — bot replies with the old
+    # "не поддерживается" hint instead of crashing.
+    groq_api_key: str = ""
+    groq_whisper_model: str = "whisper-large-v3-turbo"
+    # Hard cap on voice duration we'll transcribe. Telegram voice notes
+    # rarely exceed a minute in practice; longer = likely mis-tap.
+    voice_max_duration_sec: int = 600
+
     @property
     def betas(self) -> list[str]:
         return [b.strip() for b in self.claude_betas.split(",") if b.strip()]

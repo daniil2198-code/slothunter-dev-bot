@@ -83,34 +83,135 @@ async def cmd_start(message: Message) -> None:
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    text = (
-        "<b>Команды</b>\n\n"
-        "<code>/menu</code>    — inline-клавиатура быстрых действий\n"
-        "<code>/digest</code>  — утренний дайджест (commits, ROADMAP, прод, ошибки)\n"
-        "<code>/status</code>  — текущая папка, session id, модель, betas\n"
-        "<code>/reset</code>   — забыть разговор; перед стиранием сохранит summary\n"
-        "<code>/compact</code> — ужать историю в summary, контекст продолжается\n"
-        "<code>/history</code> — список сохранённых сессий\n"
-        "<code>/show &lt;id&gt;</code> — открыть сохранённый summary\n"
-        "<code>/resume &lt;id&gt;</code> — стартовать с этим контекстом\n"
-        "<code>/cancel</code>  — прервать текущий ход (best-effort)\n"
-        "<code>/cd &lt;path&gt;</code> — сменить рабочую директорию Claude\n"
-        "<code>/help</code>    — это сообщение\n\n"
-        "<b>Сообщения</b>\n"
-        "• Текст — задача для Claude\n"
-        "• Фото (с подписью или без) — Claude увидит и проанализирует\n"
-        "• Голос/видео — не поддерживается, используй TG-транскрипцию\n\n"
-        "<b>Новая задача в той же сессии</b>\n"
-        "Просто напиши «<i>новая задача: …</i>» или похожее. Claude поймёт "
-        "переключение, прошлый контекст останется как фон.\n\n"
-        "<b>Permissions</b>\n"
-        "Read / Edit / Write / Grep — авто.\n"
-        "Безопасные bash (<code>git status / log / diff</code>, "
-        "<code>ls</code>, <code>pytest</code>, <code>uv</code>) — авто.\n"
-        "Опасное (<code>rm</code>, <code>git push</code>, <code>deploy</code>) — "
-        "спросит inline-кнопкой."
+    """Full operator manual. Splits across multiple TG messages because
+    the limit is 4096 chars and we have a lot to say.
+
+    Each section is self-contained — sending them as separate messages
+    means the user can scroll back to one section without losing the
+    others off-screen.
+    """
+    bot = message.bot
+    assert bot is not None
+    chat_id = message.chat.id
+
+    inputs = _HELP_INPUTS.replace(
+        "{voice_limit}", str(settings.voice_max_duration_sec)
     )
-    await message.answer(text, parse_mode=ParseMode.HTML)
+    sections = [_HELP_INTRO, inputs, _HELP_COMMANDS, _HELP_PERMISSIONS, _HELP_CONTEXT, _HELP_TIPS]
+    for section in sections:
+        await bot.send_message(chat_id, section, parse_mode=ParseMode.HTML)
+
+
+# ─────────── /help section text ───────────
+# Kept as module-level constants so they stay readable as one block —
+# editing UX copy gets messy when buried inside a function.
+
+_HELP_INTRO = (
+    "📖 <b>Slot Hunter dev-bot — справка</b>\n\n"
+    "Это твой Claude Code в Telegram. Бот сидит на VPS рядом с прод-кодом "
+    "Slot Hunter и выполняет задачи как локальный Claude — читает / правит "
+    "файлы, гоняет тесты, коммитит, деплоит. Полностью автономный single-user "
+    "интерфейс: пиши текст, кидай скрины, получай результат."
+)
+
+_HELP_INPUTS = (
+    "💬 <b>Что можно отправлять</b>\n\n"
+    "• <b>Текст</b> — обычная задача для Claude. Можно длинно, можно одной "
+    "строкой («что в логах сегодня?»).\n"
+    "• <b>Фото</b> — скриншот бага, ref-дизайн, любая картинка. Бот сохранит "
+    "её на VPS, передаст Claude путь, и тот прочитает её через Read tool. "
+    "Подпись к фото = промпт; без подписи бот сам спросит «что ты видишь, "
+    "что не так».\n"
+    "• <b>Голос / аудио</b> — бот транскрибирует через Groq Whisper "
+    "(<code>whisper-large-v3-turbo</code>) и сразу передаёт текст Claude. "
+    "Сначала покажет тебе что услышал ("
+    "🎤 <i>… ваш текст …</i>), чтобы ты мог поймать ошибки распознавания. "
+    "Лимит длины — {voice_limit}s.\n"
+    "• <b>Видео / документы / стикеры</b> — пока не подключены."
+)
+
+_HELP_COMMANDS = (
+    "⚙️ <b>Команды</b>\n\n"
+    "<b>Контекст разговора</b>\n"
+    "<code>/status</code>  — папка, session id, модель, betas\n"
+    "<code>/reset</code>   — забыть разговор; перед стиранием сохранит summary\n"
+    "<code>/compact</code> — ужать историю в summary; контекст продолжается\n"
+    "<code>/cancel</code>  — прервать текущий ход (best-effort)\n"
+    "<code>/cd &lt;path&gt;</code> — сменить рабочую директорию Claude\n\n"
+    "<b>Журнал разговоров</b>\n"
+    "<code>/history</code> — список сохранённых сессий (id, время, заголовок)\n"
+    "<code>/show &lt;id&gt;</code> — открыть сохранённый summary\n"
+    "<code>/resume &lt;id&gt;</code> — новая сессия с этим контекстом как фон\n\n"
+    "<b>Быстрые действия</b>\n"
+    "<code>/menu</code>    — inline-клавиатура (Status / Diff / Tests / "
+    "Deploy / Roadmap / Logs)\n"
+    "<code>/digest</code>  — утренний дайджест по запросу (commits, ROADMAP, "
+    "прод, ошибки). Сам приходит каждый день в 09:00 Минск.\n\n"
+    "<code>/help</code>    — этот текст"
+)
+
+_HELP_PERMISSIONS = (
+    "🔐 <b>Разрешения tools</b>\n\n"
+    "Чтобы тебя не мучали кнопки на каждый чих, разделил по риску:\n\n"
+    "<b>Авто (без подтверждения)</b>\n"
+    "• Read, Glob, Grep, Edit, Write, MultiEdit, NotebookRead, TodoWrite\n"
+    "• Безопасные bash: <code>git status</code> / <code>log</code> / "
+    "<code>diff</code> / <code>show</code> / <code>fetch</code> / "
+    "<code>pull</code>, <code>ls</code>, <code>cat</code>, <code>head</code>, "
+    "<code>grep</code>, <code>pytest</code>, <code>ruff</code>, <code>mypy</code>, "
+    "<code>uv run</code>, <code>docker ps/logs/inspect</code>, "
+    "<code>systemctl status</code>, <code>journalctl</code>, "
+    "<code>curl/wget</code>\n\n"
+    "<b>Спрашивает inline-кнопкой</b>\n"
+    "• Любой Bash, который не в auto-списке\n"
+    "• WebFetch, WebSearch, Task, MCP-tools\n"
+    "• Любая команда с pipe / chain / substitution "
+    "(<code>|</code> <code>&amp;&amp;</code> <code>$(...)</code>)\n\n"
+    "<b>Громкое предупреждение ⚠️</b>\n"
+    "• <code>rm -rf</code>, <code>git push --force</code>, "
+    "<code>git reset --hard</code>, <code>git clean</code>, "
+    "<code>DROP TABLE</code>, <code>TRUNCATE</code>, "
+    "<code>docker system prune</code>, <code>shutdown</code> / <code>reboot</code>\n\n"
+    "Таймаут на ответ — 120 сек. Молчание = deny."
+)
+
+_HELP_CONTEXT = (
+    "🧠 <b>Контекст и продолжительность сессии</b>\n\n"
+    "<b>Один чат = одна непрерывная сессия Claude.</b> Прошлый контекст помогает "
+    "в новых задачах, history переживает рестарты бота (resume через "
+    "<code>session_id</code>).\n\n"
+    "<b>Новая задача в той же сессии</b>\n"
+    "Начни сообщение с «<i>новая задача: …</i>» или похожее — Claude поймёт "
+    "переключение, старая ниточка остаётся фоном.\n\n"
+    "<b>Контекст разросся</b>\n"
+    "<code>/compact</code> — Claude ужмёт историю в summary, продолжишь "
+    "работать в том же session_id.\n\n"
+    "<b>Полный чистый старт</b>\n"
+    "<code>/reset</code> — перед стиранием бот сам сохранит summary в "
+    "<code>/history</code>, потом стартует с нуля. Если потом захочешь "
+    "вернуться — <code>/resume &lt;id&gt;</code>.\n\n"
+    "<b>Auto-pull</b>\n"
+    "Перед каждой задачей бот делает <code>git fetch &amp;&amp; git pull</code> "
+    "в рабочей папке. Если ты пушнул что-то с ноута — Claude увидит. "
+    "В ответе появится строчка «↻ git pull: a1b → c2d (N коммитов)»."
+)
+
+_HELP_TIPS = (
+    "💡 <b>Подсказки</b>\n\n"
+    "• <b>Долгий ответ</b> — режется на куски по 3500 символов. Если &gt; 14 KB "
+    "— приходит файлом.\n"
+    "• <b>Подписка Claude</b>: бот использует OAuth-токен из <code>claude /login</code> "
+    "на VPS. Никаких API-ключей — твоя подписка.\n"
+    "• <b>Утренний дайджест</b> приходит сам в 09:00 Минск. Содержит "
+    "коммиты за сутки, статусы ROADMAP, что можно взять дальше, что "
+    "заблокировано, статус прода, число ошибок в логах.\n"
+    "• <b>Деплой через бота</b>: попроси «закоммить и задеплой» — Claude "
+    "сделает <code>git commit</code> + <code>push</code> + ssh-deploy. "
+    "Каждое действие спросит подтверждения.\n"
+    "• <b>Если запутался</b>: <code>/status</code> покажет где находишься, "
+    "<code>/cancel</code> прервёт залипший ход, <code>/reset</code> начнёт "
+    "с чистого."
+)
 
 
 @router.message(Command("status"))
@@ -503,21 +604,120 @@ async def on_photo(message: Message) -> None:
     await _send_reply(bot, chat_id, reply)
 
 
-# Voice / video / documents — give a friendly hint instead of silently
-# dropping. Voice transcription is on the roadmap; documents can be
-# uploaded via Claude's Read tool with a path.
-@router.message(F.voice | F.video | F.video_note | F.audio | F.document)
-async def on_unsupported_media(message: Message) -> None:
-    if message.voice or message.audio or message.video_note:
+# ─────────── Voice / audio → Whisper → Claude ───────────
+#
+# Telegram voice notes (`voice`) and uploaded audio files (`audio`)
+# are downloaded and transcribed via Groq Whisper, then forwarded to
+# Claude as an ordinary text turn. We DON'T persist the audio bytes
+# anywhere — the file lives in memory for the round-trip and gets GC'd.
+#
+# Long voice messages (over `voice_max_duration_sec`) are rejected
+# with a friendly note rather than burning Whisper budget on what's
+# almost certainly a mistap.
+
+
+@router.message(F.voice | F.audio)
+async def on_voice(message: Message) -> None:
+    bot = message.bot
+    assert bot is not None
+    chat_id = message.chat.id
+
+    # If the user hasn't configured Groq, fall back to the old hint
+    # so the bot doesn't appear broken.
+    if not settings.groq_api_key:
         await message.answer(
-            "🎤 Голос/видео пока не поддерживается. "
-            "Используй Telegram-транскрипцию (через тапе по сообщению) "
-            "и пришли текст."
+            "🎤 Голос пока не подключён (нет GROQ_API_KEY). "
+            "Используй TG-транскрипцию (long-tap по voice → "
+            "«Транскрибировать») и пришли текстом."
+        )
+        return
+
+    media = message.voice or message.audio
+    assert media is not None
+    duration = getattr(media, "duration", 0) or 0
+    if duration > settings.voice_max_duration_sec:
+        await message.answer(
+            f"🎤 Слишком длинное ({duration}s) — лимит "
+            f"{settings.voice_max_duration_sec}s. Разбей на части или "
+            "перешли текстом."
+        )
+        return
+
+    # Download the audio bytes into memory. Bot API gives us a path
+    # under api.telegram.org/file/bot<token>/<path>; aiogram's
+    # download_file streams it for us.
+    file = await bot.get_file(media.file_id)
+    if file.file_path is None:
+        await message.answer("❌ Не получилось забрать аудио у Telegram")
+        return
+    buf = await bot.download_file(file.file_path)
+    if buf is None:
+        await message.answer("❌ Telegram вернул пустой ответ")
+        return
+    audio_bytes = buf.read()
+
+    # Hint the format via filename suffix — Groq picks a decoder by it.
+    # voice → ogg/opus; audio → whatever extension TG kept.
+    ext = "ogg" if message.voice else (
+        Path(getattr(media, "file_name", "") or "audio").suffix.lstrip(".") or "mp3"
+    )
+    filename = f"voice.{ext}"
+
+    await bot.send_chat_action(chat_id, ChatAction.TYPING)
+    log.info("voice_received", chat_id=chat_id, duration_sec=duration, ext=ext)
+
+    from app.transcribe import TranscriptionError, transcribe_audio
+
+    try:
+        transcript = await transcribe_audio(audio_bytes, filename=filename)
+    except TranscriptionError as e:
+        log.warning("voice_transcribe_failed", error=str(e))
+        await message.answer(
+            f"❌ Не получилось расшифровать голос: "
+            f"<code>{html.escape(str(e)[:200])}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    except Exception as e:  # noqa: BLE001 — surface unexpected to user
+        log.exception("voice_transcribe_crash")
+        await message.answer(
+            f"❌ Сбой расшифровки ({type(e).__name__}): "
+            f"<code>{html.escape(str(e)[:200])}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    text = transcript.text.strip()
+    if not text:
+        await message.answer("🎤 Whisper вернул пустой текст — попробуй ещё раз")
+        return
+
+    # Show the user what we heard (so they can spot misreads early).
+    # Then act on it as a normal user message — Claude doesn't need to
+    # know whether the input came from text or speech.
+    await message.answer(
+        f"🎤 <i>{html.escape(text[:1500])}</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    sess = get_or_create_session(chat_id, bot)
+    reply = await sess.query(text)
+    await _send_reply(bot, chat_id, reply)
+
+
+# Video / video-notes / documents — friendly hint instead of silent drop.
+# (Voice now handled above; this branch is what's left.)
+@router.message(F.video | F.video_note | F.document)
+async def on_unsupported_media(message: Message) -> None:
+    if message.video_note or message.video:
+        await message.answer(
+            "🎥 Видео пока не подключено. Если нужен анализ кадра — "
+            "сделай скриншот и пришли как фото."
         )
     else:
         await message.answer(
-            "📄 Документы напрямую не подключены. Если файл нужен в проекте — "
-            "попроси меня создать/обновить его через Write/Edit."
+            "📄 Документы напрямую не подключены. Если файл нужен в "
+            "проекте — попроси меня создать/обновить через Write/Edit."
         )
 
 
