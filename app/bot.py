@@ -818,32 +818,55 @@ async def _send_reply(bot: Bot, chat_id: int, reply: StreamedReply) -> None:
             log.debug("auto_send_image_failed", path=str(path), error=str(e))
 
 
-# Strict path regex — matches absolute paths to image files only.
-# Anchored on common screenshot dirs so we don't accidentally surface
-# random PNGs Claude mentions in unrelated context.
-_IMAGE_PATH_RE = re.compile(
-    r"(?<![\w/])"  # no leading word char or slash
-    r"(/(?:tmp|var/lib/slothunter-dev-bot|root/\.cache/playwright-mcp|home/[^/\s]+/screenshots)"
+# Image-path regex. Two flavors:
+# 1) absolute paths under common screenshot roots (/tmp, ~/.cache/...);
+# 2) any ``.playwright-mcp/<file>`` mention — Playwright MCP writes there
+#    relative to its cwd (which is wherever the dev-bot started, usually
+#    /opt/slothunter-dev-bot). We resolve relative paths against the
+#    project root before checking existence.
+#
+# We DON'T match arbitrary "*.png" anywhere in text — that would catch
+# code-snippet asset references and spam the chat.
+_ABS_IMAGE_PATH_RE = re.compile(
+    r"(?<![\w/])"  # no leading word char or slash before
+    r"(/(?:tmp|var/lib/slothunter-dev-bot|root/\.cache/playwright-mcp|"
+    r"home/[^/\s]+/screenshots|opt/[^/\s]+/\.playwright-mcp)"
     r"/[^\s\"'<>`]+\.(?:png|jpg|jpeg|webp))",
     re.IGNORECASE,
+)
+# Relative path: ``.playwright-mcp/<filename>`` — Playwright MCP's
+# default output dir, relative to its cwd.
+_REL_PLAYWRIGHT_RE = re.compile(
+    r"(?<![\w/])"
+    r"(\.playwright-mcp/[^\s\"'<>`]+\.(?:png|jpg|jpeg|webp))",
+    re.IGNORECASE,
+)
+
+# Search roots for resolving Playwright MCP relative paths. We try the
+# project root first (where the bot was launched), then a couple of
+# common alternates.
+_PLAYWRIGHT_ROOTS = (
+    Path("/opt/slothunter-dev-bot"),
+    Path("/opt/slot-hunter"),
+    Path.cwd(),
 )
 
 
 def _extract_image_paths(text: str) -> list[Path]:
-    """Find absolute screenshot paths Claude mentioned and that exist on disk.
+    """Find screenshot paths Claude mentioned and that exist on disk.
 
-    Only auto-shipped paths under known temp/cache roots — keeps stray
-    references in code blocks ("/etc/foo.png" in a discussion) from
-    triggering uploads.
+    Both absolute paths (under whitelisted dirs) and relative
+    ``.playwright-mcp/...`` paths are recognized. The latter are resolved
+    against known project roots — Playwright MCP writes there by default.
 
-    De-duplicates while preserving order, caps at 5 to prevent runaway
-    output from spamming the chat.
+    Caps at 5 to prevent runaway output from spamming the chat.
     """
     if not text:
         return []
     seen: set[str] = set()
     out: list[Path] = []
-    for match in _IMAGE_PATH_RE.findall(text):
+
+    for match in _ABS_IMAGE_PATH_RE.findall(text):
         if match in seen:
             continue
         seen.add(match)
@@ -851,7 +874,20 @@ def _extract_image_paths(text: str) -> list[Path]:
         if path.is_file():
             out.append(path)
             if len(out) >= 5:
+                return out
+
+    for match in _REL_PLAYWRIGHT_RE.findall(text):
+        if match in seen:
+            continue
+        seen.add(match)
+        for root in _PLAYWRIGHT_ROOTS:
+            candidate = root / match
+            if candidate.is_file():
+                out.append(candidate)
+                if len(out) >= 5:
+                    return out
                 break
+
     return out
 
 
