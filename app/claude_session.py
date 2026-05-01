@@ -334,20 +334,39 @@ def _format_tool_call(block: ToolUseBlock) -> str:
         local = parts[2] if len(parts) == 3 else name
         # Friendly browser breadcrumbs.
         if local == "browser_navigate":
-            return f"🌐 navigate: {inp.get('url', '')}"
+            return f"🌐 navigate: {_redact_secrets(str(inp.get('url', '')))}"
         if local == "browser_take_screenshot":
             return f"📸 screenshot: {inp.get('filename', '(default)')}"
         if local == "browser_click":
             return f"🖱 click: {inp.get('element', inp.get('target', ''))}"
         if local in ("browser_type", "browser_fill"):
             val = str(inp.get("text") or inp.get("value") or "")[:60]
-            return f"⌨️ {local.replace('browser_', '')}: {val}"
+            return f"⌨️ {local.replace('browser_', '')}: {_redact_secrets(val)}"
         if local == "browser_snapshot":
             return "🔍 snapshot"
         if local == "browser_console_messages":
             return "📜 console"
         return f"🌐 {local}"
     return f"🔧 {name}"
+
+
+# Substrings worth redacting from tool-call breadcrumbs / activity logs.
+# Keys are loaded lazily so settings doesn't have to be importable at
+# module import time.
+def _redact_secrets(text: str) -> str:
+    """Replace known secret values with ``<redacted>`` so they don't
+    leak into the chat transcript via tool-call breadcrumbs.
+
+    Currently scrubs:
+    - ``settings.dev_auth_token`` (plain match — used in dev-mode URLs)
+
+    The match is verbatim. We don't try regex around it because the
+    token shape is unique enough that a plain ``replace`` is safe.
+    """
+    secret = (settings.dev_auth_token or "").strip()
+    if secret and secret in text:
+        text = text.replace(secret, "<redacted>")
+    return text
 
 
 def _system_prompt() -> str:
