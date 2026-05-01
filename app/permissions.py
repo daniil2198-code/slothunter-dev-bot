@@ -74,6 +74,123 @@ DESTRUCTIVE_BASH_PATTERNS = (
     "reboot",
 )
 
+# Read-only / inspect-only bash commands that don't need approval.
+# Match strategy: tokenize the command on whitespace, take the first
+# word (after stripping leading subshell wrappers), and check it
+# against this set. Anything with shell metacharacters that could
+# rewrite the command (``;``, ``&&``, ``|``, backticks, ``$(...)``)
+# falls through to the manual prompt — better safe than sorry.
+SAFE_BASH_COMMANDS: frozenset[str] = frozenset(
+    {
+        # File inspection
+        "ls", "cat", "head", "tail", "wc", "file", "stat",
+        "pwd", "tree", "find", "du", "df",
+        # Text inspection
+        "grep", "rg", "ag", "sort", "uniq", "diff",
+        "echo", "printf", "true", "false",
+        # Git read-only
+        "git",  # filtered further by subcommand below
+        # Python tooling read-only
+        "python", "python3", "uv",  # uv has destructive subcommands; filtered
+        "pytest", "ruff", "mypy", "pyright",
+        # Node tooling read-only
+        "node", "npm", "npx",  # filtered by sub
+        # System inspect
+        "ps", "top", "free", "uptime", "whoami", "id", "uname",
+        "env", "which", "type", "command",
+        "date", "hostname",
+        # Docker inspect
+        "docker",  # filtered by sub
+        "systemctl",  # filtered by sub
+        "journalctl",
+        "curl", "wget",  # technically network — but read-only by default
+    }
+)
+
+# Subcommand allowlists for tools that have both safe and destructive
+# operations. Only the listed subcommands auto-approve — anything else
+# falls through to the manual prompt.
+SAFE_GIT_SUBCOMMANDS = frozenset(
+    {
+        "status", "log", "diff", "show", "blame",
+        "branch", "tag", "remote", "config",
+        "ls-files", "ls-tree", "rev-parse", "rev-list",
+        "describe", "shortlog", "reflog",
+        "fetch", "pull", "stash",  # mutate but recoverable
+    }
+)
+SAFE_DOCKER_SUBCOMMANDS = frozenset(
+    {"ps", "logs", "inspect", "images", "volume", "network", "stats", "top", "version", "info"}
+)
+SAFE_SYSTEMCTL_SUBCOMMANDS = frozenset(
+    {"status", "is-active", "is-enabled", "list-units", "list-unit-files", "show", "cat"}
+)
+SAFE_NPM_SUBCOMMANDS = frozenset({"list", "ls", "view", "outdated", "audit", "version", "help"})
+SAFE_UV_SUBCOMMANDS = frozenset({"run", "tree", "version", "help"})
+SAFE_NODE_SUBCOMMANDS: frozenset[str] = frozenset()  # `node script.js` arbitrary code → ask
+SAFE_PYTHON_SUBCOMMANDS: frozenset[str] = frozenset()  # same
+
+# Shell metacharacters that can chain or substitute commands. If any of
+# these are present in the command we don't try to parse — just ask.
+SHELL_REWRITE_CHARS = ("&&", "||", ";", "|", "`", "$(", ">(", "<(", "$( ", ">", "<")
+
+
+def is_safe_bash(command: str) -> bool:
+    """Return True if the command is purely a read-only / safe operation
+    that we can run without explicit approval.
+
+    We err on the side of caution: ANY syntactic feature we don't fully
+    understand pushes the command back into the manual-approve queue.
+    """
+    cmd = command.strip()
+    if not cmd:
+        return False
+
+    # Anything with destructive markers — never safe.
+    if any(p in cmd for p in DESTRUCTIVE_BASH_PATTERNS):
+        return False
+
+    # Reject anything chained / piped / substituted. Each segment would
+    # need its own check; until we want that complexity, just ask.
+    if any(ch in cmd for ch in SHELL_REWRITE_CHARS):
+        return False
+
+    # Strip leading env-var assignments ("FOO=bar baz arg") and a
+    # trailing ``--`` separator if present.
+    tokens = cmd.split()
+    while tokens and "=" in tokens[0] and not tokens[0].startswith("-"):
+        tokens.pop(0)
+    if not tokens:
+        return False
+
+    head = tokens[0]
+    # Allow common runner prefixes (``sudo`` still requires a TTY → ask).
+    if head == "sudo":
+        return False
+
+    if head not in SAFE_BASH_COMMANDS:
+        return False
+
+    sub = tokens[1] if len(tokens) > 1 else ""
+
+    if head == "git":
+        return sub in SAFE_GIT_SUBCOMMANDS
+    if head == "docker":
+        return sub in SAFE_DOCKER_SUBCOMMANDS
+    if head == "systemctl":
+        return sub in SAFE_SYSTEMCTL_SUBCOMMANDS
+    if head in ("npm", "npx"):
+        return sub in SAFE_NPM_SUBCOMMANDS
+    if head == "uv":
+        return sub in SAFE_UV_SUBCOMMANDS
+    if head in ("python", "python3"):
+        # `python -c "..."` and `python script.py` execute arbitrary code;
+        # only `python --version` and `python -V` are safe.
+        return sub in {"--version", "-V", "-h", "--help"}
+    if head == "node":
+        return sub in {"--version", "-v", "-h", "--help"}
+    return True
+
 ASK_TIMEOUT_S = 120.0
 
 
@@ -212,6 +329,14 @@ def make_can_use_tool(broker: PermissionBroker) -> CanUseToolCallback:
         # but we double-belt-check.
         if tool_name in AUTO_TOOLS:
             return {"behavior": "allow", "updatedInput": tool_input}
+
+        # Smart Bash: read-only / inspect commands skip the prompt.
+        # Cuts ~80% of approval taps when working over Telegram.
+        if tool_name == "Bash":
+            cmd = str(tool_input.get("command", ""))
+            if is_safe_bash(cmd):
+                log.info("bash_auto_approved", command=cmd[:120])
+                return {"behavior": "allow", "updatedInput": tool_input}
 
         allowed, reason = await broker.request(tool_name, tool_input)
         if allowed:

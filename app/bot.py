@@ -8,22 +8,31 @@ Commands:
     /start        — say hello, show working directory
     /status       — current cwd, session id, pending approval
     /reset        — drop the conversation; next message starts fresh
+    /compact      — compress conversation history into a summary
     /cancel       — best-effort interrupt of the in-flight Claude turn
     /cd <path>    — switch Claude's working directory (must exist)
+    /menu         — quick-tap inline keyboard for common dev actions
     /help         — list of commands
 
-Anything else is forwarded to Claude as a user message.
+Anything else (text, photos with captions) is forwarded to Claude.
 """
 
 from __future__ import annotations
 
 import html
+import time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BufferedInputFile, CallbackQuery, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from app.auth import AllowedUserMiddleware
 from app.chunker import chunk_text, is_too_long_for_messages
@@ -58,8 +67,16 @@ async def cmd_start(message: Message) -> None:
     text = (
         "👋 <b>Slot Hunter dev-bot</b>\n\n"
         f"Рабочая директория: <code>{html.escape(str(sess.state.cwd))}</code>\n"
-        "Просто пиши задачу обычным сообщением — я её передам Claude Code.\n\n"
-        "Команды: /status /reset /cancel /cd /help"
+        "Перед каждой задачей делаю <code>git pull</code> автоматически.\n\n"
+        "<b>Как работать</b>\n"
+        "• Просто пиши задачу — я передам Claude Code\n"
+        "• Картинки тоже принимаю (скриншот бага → опиши проблему)\n"
+        "• <code>/menu</code> — кнопки быстрых действий\n"
+        "• <b>Новая задача?</b> начни сообщение со «<i>новая задача:</i>» — "
+        "Claude сам поймёт сегментацию. История полезна как контекст.\n"
+        "• Контекст разросся → <code>/compact</code>. "
+        "Хочешь полный чистый старт → <code>/reset</code>.\n\n"
+        "Все команды: /help"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -68,13 +85,26 @@ async def cmd_start(message: Message) -> None:
 async def cmd_help(message: Message) -> None:
     text = (
         "<b>Команды</b>\n\n"
-        "<code>/status</code>  — текущая папка, session id, активность\n"
+        "<code>/menu</code>    — inline-клавиатура быстрых действий\n"
+        "<code>/status</code>  — текущая папка, session id, модель, betas\n"
         "<code>/reset</code>   — забыть разговор, следующее сообщение начнёт с чистого\n"
         "<code>/compact</code> — ужать историю в summary, контекст продолжается\n"
         "<code>/cancel</code>  — прервать текущий ход (best-effort)\n"
         "<code>/cd &lt;path&gt;</code> — сменить рабочую директорию Claude\n"
         "<code>/help</code>    — это сообщение\n\n"
-        "Любое другое сообщение — задача для Claude."
+        "<b>Сообщения</b>\n"
+        "• Текст — задача для Claude\n"
+        "• Фото (с подписью или без) — Claude увидит и проанализирует\n"
+        "• Голос/видео — не поддерживается, используй TG-транскрипцию\n\n"
+        "<b>Новая задача в той же сессии</b>\n"
+        "Просто напиши «<i>новая задача: …</i>» или похожее. Claude поймёт "
+        "переключение, прошлый контекст останется как фон.\n\n"
+        "<b>Permissions</b>\n"
+        "Read / Edit / Write / Grep — авто.\n"
+        "Безопасные bash (<code>git status / log / diff</code>, "
+        "<code>ls</code>, <code>pytest</code>, <code>uv</code>) — авто.\n"
+        "Опасное (<code>rm</code>, <code>git push</code>, <code>deploy</code>) — "
+        "спросит inline-кнопкой."
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -151,6 +181,90 @@ async def cmd_cd(message: Message, command: CommandObject) -> None:
     )
 
 
+# ─────────── Inline quick-action menu ───────────
+#
+# Quick-tap macros for common dev operations. Each button maps to a
+# canned prompt the bot sends to Claude on the user's behalf — no
+# typing required when on the move.
+#
+# Picked actions on the principle of "I do this multiple times a day":
+#   - Status   → "git status, what's the project state?"
+#   - Diff     → "git diff against origin/main, summarize"
+#   - Tests    → run pytest
+#   - Deploy   → run scripts/deploy.sh on slot-hunter
+#   - Roadmap  → show the top of notes/ROADMAP.md
+#   - Logs     → tail prod logs
+
+_MENU_PROMPTS: dict[str, str] = {
+    "status": (
+        "Покажи git status (uncommitted), последний коммит и кратко состояние проекта. "
+        "Не редактируй ничего."
+    ),
+    "diff": (
+        "Покажи git diff против origin/main кратко: какие файлы изменились "
+        "и в двух предложениях что меняем. Если ничего не изменилось — так и скажи."
+    ),
+    "tests": "Запусти uv run pytest и покажи итоговый счёт + первую упавшую если есть.",
+    "deploy": (
+        "Закоммить текущие изменения если есть (придумай осмысленное conventional-commit "
+        "сообщение), запушь на origin/main и задеплой на прод через "
+        "expect+ssh root@104.152.48.210 'cd /opt/slot-hunter && bash scripts/deploy.sh'. "
+        "Сначала спроси у меня подтверждения через Bash — я разрешу."
+    ),
+    "roadmap": (
+        "Покажи notes/ROADMAP.md — секции In progress, Planned next и Done за последние 7 дней."
+    ),
+    "logs": (
+        "Покажи последние 30 строк journalctl -u slot-hunter-api на проде. "
+        "Если есть ERROR/WARN — выдели."
+    ),
+}
+
+
+def _menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📊 Status", callback_data="menu:status"),
+                InlineKeyboardButton(text="🧾 Diff", callback_data="menu:diff"),
+            ],
+            [
+                InlineKeyboardButton(text="🧪 Tests", callback_data="menu:tests"),
+                InlineKeyboardButton(text="🚀 Deploy", callback_data="menu:deploy"),
+            ],
+            [
+                InlineKeyboardButton(text="🗺 Roadmap", callback_data="menu:roadmap"),
+                InlineKeyboardButton(text="📜 Logs", callback_data="menu:logs"),
+            ],
+        ]
+    )
+
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message) -> None:
+    await message.answer("Быстрые действия:", reply_markup=_menu_keyboard())
+
+
+@router.callback_query(F.data.startswith("menu:"))
+async def cb_menu(callback: CallbackQuery) -> None:
+    if callback.message is None or callback.data is None:
+        await callback.answer()
+        return
+    action = callback.data.split(":", 1)[1]
+    prompt = _MENU_PROMPTS.get(action)
+    if prompt is None:
+        await callback.answer("неизвестное действие", show_alert=True)
+        return
+    await callback.answer(f"⏳ {action}…")
+    bot = callback.bot
+    assert bot is not None
+    chat_id = callback.message.chat.id
+    sess = get_or_create_session(chat_id, bot)
+    await bot.send_chat_action(chat_id, ChatAction.TYPING)
+    reply = await sess.query(prompt)
+    await _send_reply(bot, chat_id, reply)
+
+
 # ─────────── Permission button callbacks ───────────
 
 
@@ -183,7 +297,7 @@ async def on_text(message: Message) -> None:
     assert bot is not None
     sess = get_or_create_session(message.chat.id, bot)
 
-    typing_task = await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     log.info("query_start", chat_id=message.chat.id, len=len(message.text))
 
     reply = await sess.query(message.text)
@@ -197,7 +311,77 @@ async def on_text(message: Message) -> None:
         cancelled=reply.cancelled,
         error=bool(reply.error),
     )
-    del typing_task  # silence unused warning — typing indicator is fire-and-forget
+
+
+# ─────────── Image input ───────────
+#
+# Photos are downloaded to ``state_dir/incoming/<chat>/<ts>.jpg`` and the
+# absolute path is appended to the prompt. Claude Code's Read tool
+# supports images natively — when the prompt mentions a path, Claude
+# decides whether to Read it, and can describe what's in the picture.
+#
+# Captions are forwarded as the prompt text. Without a caption we
+# default to "Что ты видишь на этой картинке? Если это скриншот — что
+# в нём не так / нужно исправить?".
+
+
+@router.message(F.photo)
+async def on_photo(message: Message) -> None:
+    bot = message.bot
+    assert bot is not None
+    chat_id = message.chat.id
+    sess = get_or_create_session(chat_id, bot)
+
+    # Telegram resamples photos at multiple sizes; the last entry is the
+    # largest. That's what Claude wants.
+    if not message.photo:
+        return
+    photo = message.photo[-1]
+
+    incoming = settings.state_dir / "incoming" / str(chat_id)
+    incoming.mkdir(parents=True, exist_ok=True)
+    fname = f"{int(time.time())}_{photo.file_unique_id}.jpg"
+    path = incoming / fname
+
+    file = await bot.get_file(photo.file_id)
+    if file.file_path is None:
+        await message.answer("❌ Не получилось забрать картинку у Telegram")
+        return
+    await bot.download_file(file.file_path, destination=str(path))
+
+    caption = (message.caption or "").strip()
+    default_q = (
+        "Что ты видишь на этой картинке? Если это скриншот UI — "
+        "что в нём может быть не так / что нужно исправить в коде?"
+    )
+    prompt = (
+        f"{caption or default_q}\n\n"
+        f"📎 Приложена картинка: {path}\n"
+        f"Прочитай её через Read tool, чтобы увидеть содержимое."
+    )
+
+    await bot.send_chat_action(chat_id, ChatAction.TYPING)
+    log.info("photo_received", chat_id=chat_id, path=str(path), has_caption=bool(caption))
+    reply = await sess.query(prompt)
+    await _send_reply(bot, chat_id, reply)
+
+
+# Voice / video / documents — give a friendly hint instead of silently
+# dropping. Voice transcription is on the roadmap; documents can be
+# uploaded via Claude's Read tool with a path.
+@router.message(F.voice | F.video | F.video_note | F.audio | F.document)
+async def on_unsupported_media(message: Message) -> None:
+    if message.voice or message.audio or message.video_note:
+        await message.answer(
+            "🎤 Голос/видео пока не поддерживается. "
+            "Используй Telegram-транскрипцию (через тапе по сообщению) "
+            "и пришли текст."
+        )
+    else:
+        await message.answer(
+            "📄 Документы напрямую не подключены. Если файл нужен в проекте — "
+            "попроси меня создать/обновить его через Write/Edit."
+        )
 
 
 async def _send_reply(bot: Bot, chat_id: int, reply: StreamedReply) -> None:
@@ -218,6 +402,10 @@ async def _send_reply(bot: Bot, chat_id: int, reply: StreamedReply) -> None:
 
     if not body:
         body = "<i>(пустой ответ)</i>"
+
+    # Auto-pull breadcrumb — sits above tools/answer when the cwd updated.
+    if reply.pre_note:
+        body = f"<i>↻ {html.escape(reply.pre_note)}</i>\n\n" + body
 
     if reply.cancelled:
         body = "<i>⏹ прервано</i>\n\n" + body

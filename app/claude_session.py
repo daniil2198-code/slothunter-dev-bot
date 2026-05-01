@@ -37,6 +37,7 @@ from claude_agent_sdk import (
 )
 
 from app.config import settings
+from app.git_sync import maybe_pull_workdir
 from app.logging import get_logger
 from app.permissions import AUTO_TOOLS, PermissionBroker, make_can_use_tool
 
@@ -104,6 +105,9 @@ class StreamedReply:
     session_id: str | None = None
     error: str | None = None
     cancelled: bool = False
+    # Optional pre-message (rendered above the answer) — currently only
+    # used by the auto-pull feature to surface "git pull: a1b → c2d".
+    pre_note: str | None = None
 
 
 class ChatSession:
@@ -139,10 +143,17 @@ class ChatSession:
         async with self._lock:
             self._cancel_event.clear()
             try:
+                # Sync cwd with origin so the bot doesn't write on top of
+                # commits the user pushed from their laptop. Best-effort —
+                # never blocks the turn on git errors.
+                pull_note = await maybe_pull_workdir(self.state.cwd)
                 await self._ensure_client()
                 assert self._client is not None
                 await self._client.query(user_text)
-                return await self._collect_reply()
+                reply = await self._collect_reply()
+                if pull_note:
+                    reply.pre_note = pull_note
+                return reply
             except Exception as e:  # noqa: BLE001 — surface anything to TG
                 log.exception("query_failed", chat_id=self.chat_id)
                 return StreamedReply(error=f"{type(e).__name__}: {e}")
