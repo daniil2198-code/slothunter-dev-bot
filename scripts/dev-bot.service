@@ -1,0 +1,28 @@
+[Unit]
+Description=Slot Hunter dev-bot — Telegram → Claude Code bridge
+Documentation=https://github.com/daniil2198-code/slothunter-dev-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as root for now (matches existing slot-hunter setup; #0019 will add
+# a non-root deploy user across both services).
+User=root
+WorkingDirectory=/opt/slothunter-dev-bot
+EnvironmentFile=/opt/slothunter-dev-bot/.env
+# uv run = use the project venv at .venv/. uv installs deps on first run.
+ExecStart=/root/.local/bin/uv run python -m app.main
+Restart=on-failure
+RestartSec=5s
+# Don't restart aggressively on permanent failures (bad token, login expired).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Logs → journald, structured JSON. View with `journalctl -u dev-bot -f`.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dev-bot
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.python-version
+uv.lock
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Local Claude session state — never commit. The OAuth token from
+# `claude /login` lives in ~/.claude/, not here, but be paranoid.
+.claude/
+sessions/
