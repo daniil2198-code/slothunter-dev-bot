@@ -64,6 +64,74 @@ AUTO_TOOLS = frozenset(
     }
 )
 
+
+# ─────────── Playwright MCP browser tools ───────────
+#
+# When the Playwright MCP server is enabled, Claude gets ``mcp__playwright__*``
+# tools (navigate, click, type, screenshot, etc.). MCP tool names are
+# ``mcp__<server>__<name>`` — they DON'T match ``allowed_tools`` literal
+# strings, so we filter them in ``can_use_tool`` below.
+#
+# Two-tier policy:
+# - **Auto**: read-only browser ops (snapshots, screenshots, console, network)
+#   AND interaction ops (click, type, fill, drag) — the whole point of
+#   M3 is autonomous testing, asking on every click defeats it.
+# - **Ask**: anything that runs arbitrary JS (``evaluate``,
+#   ``run_code_unsafe``) — those are the equivalent of Bash and need a
+#   second pair of eyes.
+# - **Deny**: nothing currently. ``run_code_unsafe`` is gated behind a
+#   manual approval; Claude has the freedom to ask for it but it won't
+#   slip through.
+
+_BROWSER_AUTO_TOOLS = frozenset(
+    {
+        # Inspection — read-only by definition.
+        "browser_snapshot",
+        "browser_take_screenshot",
+        "browser_console_messages",
+        "browser_network_requests",
+        "browser_network_request",
+        "browser_get_page_text",
+        "browser_read_page",
+        "browser_inspect",
+        "browser_find",
+        # Navigation — observable, recoverable.
+        "browser_navigate",
+        "browser_navigate_back",
+        "browser_resize",
+        "browser_wait_for",
+        "browser_tabs",
+        # Interaction — needed for any autonomous test scenario.
+        # Mini App is the user's own dev environment; click-to-test is
+        # the primary use case, asking on each click would break the flow.
+        "browser_click",
+        "browser_type",
+        "browser_fill",
+        "browser_fill_form",
+        "browser_select_option",
+        "browser_press_key",
+        "browser_hover",
+        "browser_drag",
+        "browser_drop",
+        "browser_file_upload",
+        "browser_handle_dialog",
+        "browser_close",
+        # Inspection helpers and harmless misc.
+        "browser_screenshot",  # Claude_Preview alias
+        "browser_resize_window",
+    }
+)
+
+# These ALWAYS require user approval, even if browser auto is on.
+# - evaluate runs arbitrary user-defined JS in the page context;
+# - run_code_unsafe runs JS in the Playwright Node server (RCE-grade).
+_BROWSER_ALWAYS_ASK = frozenset(
+    {
+        "browser_evaluate",
+        "browser_run_code_unsafe",
+    }
+)
+
 # Bash commands that warrant a louder warning. Substring match,
 # case-sensitive — these are command-line tokens, not English.
 DESTRUCTIVE_BASH_PATTERNS = (
@@ -340,6 +408,29 @@ def make_can_use_tool(broker: PermissionBroker) -> CanUseToolCallback:
         # but we double-belt-check.
         if tool_name in AUTO_TOOLS:
             return PermissionResultAllow(updated_input=tool_input)
+
+        # MCP tool names look like ``mcp__<server>__<name>``. Strip the
+        # prefix to match against our local whitelists. We don't bother
+        # validating the server name — having Playwright MCP enabled is
+        # already opt-in via env var.
+        local_name = tool_name
+        if tool_name.startswith("mcp__"):
+            parts = tool_name.split("__", 2)
+            if len(parts) == 3:
+                local_name = parts[2]
+
+        # Browser tool policy.
+        if local_name in _BROWSER_AUTO_TOOLS:
+            log.info("browser_auto_approved", tool=tool_name)
+            return PermissionResultAllow(updated_input=tool_input)
+        if local_name in _BROWSER_ALWAYS_ASK:
+            allowed, reason = await broker.request(tool_name, tool_input)
+            if allowed:
+                return PermissionResultAllow(updated_input=tool_input)
+            return PermissionResultDeny(
+                message=reason or "Отклонено пользователем",
+                interrupt=False,
+            )
 
         # Smart Bash: read-only / inspect commands skip the prompt.
         # Cuts ~80% of approval taps when working over Telegram.

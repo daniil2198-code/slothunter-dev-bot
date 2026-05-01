@@ -20,6 +20,7 @@ Anything else (text, photos with captions) is forwarded to Claude.
 from __future__ import annotations
 
 import html
+import re
 import time
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -97,7 +99,16 @@ async def cmd_help(message: Message) -> None:
     inputs = _HELP_INPUTS.replace(
         "{voice_limit}", str(settings.voice_max_duration_sec)
     )
-    sections = [_HELP_INTRO, inputs, _HELP_COMMANDS, _HELP_PERMISSIONS, _HELP_CONTEXT, _HELP_TIPS]
+    sections = [
+        _HELP_INTRO,
+        inputs,
+        _HELP_COMMANDS,
+        _HELP_PERMISSIONS,
+        _HELP_CONTEXT,
+    ]
+    if settings.playwright_mcp_enabled:
+        sections.append(_HELP_BROWSER)
+    sections.append(_HELP_TIPS)
     for section in sections:
         await bot.send_message(chat_id, section, parse_mode=ParseMode.HTML)
 
@@ -194,6 +205,26 @@ _HELP_CONTEXT = (
     "Перед каждой задачей бот делает <code>git fetch &amp;&amp; git pull</code> "
     "в рабочей папке. Если ты пушнул что-то с ноута — Claude увидит. "
     "В ответе появится строчка «↻ git pull: a1b → c2d (N коммитов)»."
+)
+
+_HELP_BROWSER = (
+    "🌐 <b>Браузер для Claude (M3)</b>\n\n"
+    "Когда включен Playwright MCP (<code>PLAYWRIGHT_MCP_ENABLED=true</code> "
+    "в .env), Claude умеет:\n"
+    "• ходить по URL, читать DOM, делать скриншоты\n"
+    "• кликать элементы, заполнять формы\n"
+    "• читать console / network логи страницы\n\n"
+    "Auto-approve: navigate, screenshot, snapshot, click, type, "
+    "fill, console_messages, network_requests.\n"
+    "Спрашивает: <code>browser_evaluate</code> и "
+    "<code>browser_run_code_unsafe</code> (произвольный JS).\n\n"
+    "Скриншоты, которые Claude кладёт в <code>/tmp/</code> или "
+    "<code>~/.cache/playwright-mcp/</code>, бот сам подхватывает и "
+    "присылает как фото.\n\n"
+    "Примеры запросов:\n"
+    "• <i>«сделай скриншот mini.slothunter.space»</i>\n"
+    "• <i>«пробеги wizard Минск→Брест и проверь что нет console errors»</i>\n"
+    "• <i>«покажи что отдаёт /api/healthz через браузер»</i>"
 )
 
 _HELP_TIPS = (
@@ -772,6 +803,52 @@ async def _send_reply(bot: Bot, chat_id: int, reply: StreamedReply) -> None:
             log.warning("send_chunk_failed", error=str(e), chunk_idx=i)
             # Fall back to plain text on parse error.
             await bot.send_message(chat_id, chunk[: 4096])
+
+    # Auto-attach any image files Claude mentions in the reply. Common
+    # case: Playwright took a screenshot, saved to /tmp/foo.png, Claude
+    # tells the user "see /tmp/foo.png". We pick those up and ship.
+    for path in _extract_image_paths(reply.text):
+        try:
+            await bot.send_photo(chat_id, FSInputFile(str(path)))
+        except Exception as e:  # noqa: BLE001
+            log.debug("auto_send_image_failed", path=str(path), error=str(e))
+
+
+# Strict path regex — matches absolute paths to image files only.
+# Anchored on common screenshot dirs so we don't accidentally surface
+# random PNGs Claude mentions in unrelated context.
+_IMAGE_PATH_RE = re.compile(
+    r"(?<![\w/])"  # no leading word char or slash
+    r"(/(?:tmp|var/lib/slothunter-dev-bot|root/\.cache/playwright-mcp|home/[^/\s]+/screenshots)"
+    r"/[^\s\"'<>`]+\.(?:png|jpg|jpeg|webp))",
+    re.IGNORECASE,
+)
+
+
+def _extract_image_paths(text: str) -> list[Path]:
+    """Find absolute screenshot paths Claude mentioned and that exist on disk.
+
+    Only auto-shipped paths under known temp/cache roots — keeps stray
+    references in code blocks ("/etc/foo.png" in a discussion) from
+    triggering uploads.
+
+    De-duplicates while preserving order, caps at 5 to prevent runaway
+    output from spamming the chat.
+    """
+    if not text:
+        return []
+    seen: set[str] = set()
+    out: list[Path] = []
+    for match in _IMAGE_PATH_RE.findall(text):
+        if match in seen:
+            continue
+        seen.add(match)
+        path = Path(match)
+        if path.is_file():
+            out.append(path)
+            if len(out) >= 5:
+                break
+    return out
 
 
 # ─────────── Dispatcher factory ───────────

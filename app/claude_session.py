@@ -238,6 +238,20 @@ class ChatSession:
             opts["model"] = settings.model
         if settings.betas:
             opts["betas"] = settings.betas
+
+        # Playwright MCP — opt-in (M3). Lets Claude drive a headless
+        # browser through ``mcp__playwright__*`` tools. Permissions for
+        # those are handled in ``permissions.make_can_use_tool``.
+        if settings.playwright_mcp_enabled:
+            opts["mcp_servers"] = {
+                "playwright": {
+                    "type": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@playwright/mcp@latest", "--headless"],
+                }
+            }
+            log.info("playwright_mcp_enabled")
+
         options = ClaudeAgentOptions(**opts)  # type: ignore[arg-type]
         self._client = ClaudeSDKClient(options=options)
         await self._client.connect()
@@ -314,6 +328,25 @@ def _format_tool_call(block: ToolUseBlock) -> str:
         return f"🔧 Grep: /{pat}/"
     if name == "Glob":
         return f"🔧 Glob: {inp.get('pattern')}"
+    # MCP tools — strip the ``mcp__<server>__`` prefix for display.
+    if name.startswith("mcp__"):
+        parts = name.split("__", 2)
+        local = parts[2] if len(parts) == 3 else name
+        # Friendly browser breadcrumbs.
+        if local == "browser_navigate":
+            return f"🌐 navigate: {inp.get('url', '')}"
+        if local == "browser_take_screenshot":
+            return f"📸 screenshot: {inp.get('filename', '(default)')}"
+        if local == "browser_click":
+            return f"🖱 click: {inp.get('element', inp.get('target', ''))}"
+        if local in ("browser_type", "browser_fill"):
+            val = str(inp.get("text") or inp.get("value") or "")[:60]
+            return f"⌨️ {local.replace('browser_', '')}: {val}"
+        if local == "browser_snapshot":
+            return "🔍 snapshot"
+        if local == "browser_console_messages":
+            return "📜 console"
+        return f"🌐 {local}"
     return f"🔧 {name}"
 
 
@@ -335,7 +368,7 @@ def _system_prompt() -> str:
        no "I'll now…" preambles. The transport is lossy (chunked at
        3500 chars) and slow (typing animation). Density wins.
     """
-    return (
+    base = (
         "Ты работаешь на VPS, общаешься с пользователем через Telegram-бота. "
         "Транспорт медленный (typing-animation, лимит 3500 символов на "
         "сообщение), поэтому КРАТКОСТЬ — приоритет.\n\n"
@@ -353,3 +386,17 @@ def _system_prompt() -> str:
         "5. Когда задача завершена, дай ОДНО предложение результата "
         "и опционально следующий шаг."
     )
+    if settings.playwright_mcp_enabled:
+        base += (
+            "\n\nBROWSER:\n"
+            "У тебя есть Playwright MCP — инструменты "
+            "``mcp__playwright__browser_*`` (navigate, click, type, "
+            "screenshot, snapshot, console_messages, network_requests). "
+            "Используй их для проверки Mini App ("
+            "https://mini.slothunter.space) после деплоя или по запросу "
+            "пользователя ('сделай скриншот', 'протестируй wizard', "
+            "'проверь что нет console errors'). Скриншоты сохраняются "
+            "локально на VPS — после browser_take_screenshot отдай "
+            "пользователю путь к файлу, бот его подхватит и пришлёт."
+        )
+    return base

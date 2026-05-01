@@ -62,6 +62,14 @@ class Settings(BaseSettings):
     # rarely exceed a minute in practice; longer = likely mis-tap.
     voice_max_duration_sec: int = 600
 
+    # ─────── Playwright MCP (M3.1) ───────
+    # When true, Claude in this bot gets ``mcp__playwright__*`` tools
+    # via the Playwright MCP server (``npx @playwright/mcp``). Browser
+    # ops (click, type, screenshot) auto-approve; ``evaluate`` /
+    # ``run_code_unsafe`` always ask. Requires ``npx`` + a working
+    # Chromium install on the host (see scripts/install_playwright.sh).
+    playwright_mcp_enabled: bool = False
+
     @property
     def betas(self) -> list[str]:
         return [b.strip() for b in self.claude_betas.split(",") if b.strip()]
