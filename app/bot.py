@@ -84,9 +84,16 @@ async def cmd_status(message: Message) -> None:
     sess = get_or_create_session(message.chat.id, message.bot)  # type: ignore[arg-type]
     sid = sess.state.session_id or "<i>(новая сессия)</i>"
     pending = "есть" if _brokers[message.chat.id]._pending else "нет"  # noqa: SLF001
+    # ``settings.model`` is the requested id; the actual model the SDK
+    # connects to should match unless Claude Code falls back. The user
+    # can verify by asking the bot directly: "какая ты модель?".
+    model = settings.model or "<i>(default — Claude Code chooses)</i>"
+    betas = ", ".join(settings.betas) if settings.betas else "<i>(none)</i>"
     text = (
         f"📍 cwd: <code>{html.escape(str(sess.state.cwd))}</code>\n"
         f"🆔 session: <code>{html.escape(sid)}</code>\n"
+        f"🤖 model: <code>{html.escape(model)}</code>\n"
+        f"🧪 betas: <code>{betas}</code>\n"
         f"⏳ ожидание подтверждения: {pending}"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
