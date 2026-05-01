@@ -392,16 +392,38 @@ def _system_prompt() -> str:
             "У тебя есть Playwright MCP — инструменты "
             "``mcp__playwright__browser_*`` (navigate, click, type, "
             "screenshot, snapshot, console_messages, network_requests). "
-            "Используй их для проверки Mini App "
-            "(https://slothunter.space — это и сайт и Mini App, "
-            "Telegram WebApp открывается через URL ?startapp=...). "
-            "Используй для запросов 'сделай скриншот', 'протестируй wizard', "
-            "'проверь что нет console errors'. \n\n"
+            "Используй для запросов 'сделай скриншот', 'протестируй "
+            "wizard', 'проверь что нет console errors'.\n\n"
             "ВАЖНО: если browser_navigate возвращает ошибку или редирект — "
             "СНАЧАЛА сделай browser_take_screenshot на текущей странице "
             "и покажи пользователю что увидел. Не лезь в Bash диагностить "
             "DNS/curl — у тебя есть скриншот, который сразу скажет в чём дело.\n\n"
-            "Скриншоты сохраняй в /tmp/screenshot-<имя>.png — бот авто-"
-            "подхватит путь из твоего ответа и пришлёт картинкой."
+            "Скриншоты сохраняй в /tmp/screenshot-<имя>.png ИЛИ "
+            ".playwright-mcp/<имя>.png — бот авто-подхватит путь из "
+            "твоего ответа и пришлёт картинкой."
         )
+        # Dev-mode auth bypass — only mention if configured. Without it,
+        # Claude sees only the "open via bot" splash and can't test
+        # wizards / alerts / paywall.
+        if settings.dev_auth_token:
+            base += (
+                f"\n\nMINI APP:\n"
+                f"Главный URL для тестов — {settings.miniapp_url}/"
+                f"?dev_token={settings.dev_auth_token}\n"
+                "Это dev-mode bypass: Mini App грузится как у залогиненного "
+                "юзера, можно гонять wizard, проверять список алертов, "
+                "видеть API-ответы. БЕЗ ?dev_token будет splash «Открой "
+                "через бота» — для тестов бесполезно.\n\n"
+                "Не показывай этот URL пользователю в чистом виде "
+                "(токен — секрет). Если нужно процитировать — заменяй "
+                "значение токена на ``<dev_token>``."
+            )
+        else:
+            base += (
+                "\n\nMini App grade auth: dev-token не настроен. "
+                "Можешь делать только публичные скриншоты "
+                f"({settings.miniapp_url}) — увидишь splash. Чтобы "
+                "потестить wizard, попроси пользователя выставить "
+                "DEV_AUTH_TOKEN в env и перезапустить."
+            )
     return base

@@ -70,6 +70,18 @@ class Settings(BaseSettings):
     # Chromium install on the host (see scripts/install_playwright.sh).
     playwright_mcp_enabled: bool = False
 
+    # ─────── Dev-mode auth bypass for Mini App (M3.2) ───────
+    # Same shared secret that's set in slot-hunter's .env. Lets Claude
+    # open https://slothunter.space/?dev_token=<this> and reach the API
+    # without forging Telegram WebApp HMAC. The bot reads it from env
+    # so the system prompt can give Claude the actual URL to navigate
+    # to. Empty / unset = M3.2 effectively disabled (Claude only sees
+    # the splash screen).
+    dev_auth_token: str = ""
+    # Used to assemble the dev-mode URL. Defaults to the production
+    # Mini App; can override for staging.
+    miniapp_url: str = "https://slothunter.space"
+
     @property
     def betas(self) -> list[str]:
         return [b.strip() for b in self.claude_betas.split(",") if b.strip()]
