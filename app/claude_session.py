@@ -126,12 +126,44 @@ class ChatSession:
         # Set when the user asks to cancel the current turn (/cancel).
         self._cancel_event = asyncio.Event()
 
-    async def reset(self) -> None:
-        """Drop any cached client + erase session_id (Claude starts fresh)."""
+    async def reset(self) -> str | None:
+        """Drop any cached client + erase session_id (Claude starts fresh).
+
+        Before wiping, asks Claude for a ``/compact`` summary and stores
+        it via ``app.history``. Returns the title of the saved entry
+        (so the caller can confirm "сохранил X") or ``None`` if there
+        was nothing to save (no active session) or saving failed.
+
+        Saving is best-effort — a /reset must always succeed even if
+        Claude or the filesystem cooperate poorly.
+        """
+        from app.history import save_summary  # local import to avoid cycle
+
+        saved_title: str | None = None
+
         async with self._lock:
+            if self.state.session_id and self._client is not None:
+                # Ask Claude to summarize before we drop the session.
+                # /compact is a builtin Claude Code slash-command — the
+                # response goes through the regular message stream.
+                try:
+                    await self._client.query(
+                        "/compact опиши коротко (3-6 предложений) о чём была сессия "
+                        "и какие итоги, чтобы я мог потом вернуться к этому контексту."
+                    )
+                    summary_reply = await self._collect_reply()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("compact_before_reset_failed", error=str(e))
+                else:
+                    entry = save_summary(self.chat_id, summary_reply.text)
+                    if entry is not None:
+                        saved_title = entry.title
+
             await self._close_client()
             self.state.session_id = None
             self.state.save()
+
+        return saved_title
 
     def request_cancel(self) -> None:
         """Signal the active turn to stop. Best-effort — Claude finishes
@@ -161,6 +193,33 @@ class ChatSession:
     async def aclose(self) -> None:
         async with self._lock:
             await self._close_client()
+
+    async def seed_with_summary(self, summary: str) -> None:
+        """Start a fresh session pre-loaded with a previous-session
+        summary so Claude has the context.
+
+        Implementation: drop any current session (without saving — the
+        caller is doing this on purpose), then send the summary as the
+        opening user message wrapped in a context block. The next
+        regular ``query()`` then continues normally.
+        """
+        async with self._lock:
+            await self._close_client()
+            self.state.session_id = None
+            self.state.save()
+
+            await self._ensure_client()
+            assert self._client is not None
+            seed = (
+                "Контекст из предыдущей сессии (для справки, не отвечай "
+                "на это сообщение, просто запомни):\n\n"
+                f"{summary}\n\n"
+                "Готов к новым задачам в этом контексте."
+            )
+            await self._client.query(seed)
+            # Drain the response so the session_id gets saved + the
+            # acknowledgement doesn't leak into the user's first turn.
+            await self._collect_reply()
 
     # ─────────── internals ───────────
 

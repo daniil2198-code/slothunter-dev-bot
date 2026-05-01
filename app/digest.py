@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -50,6 +50,8 @@ class CommitsBlock:
 class RoadmapBlock:
     in_progress: int
     new_done: list[str]
+    next_up: list[str]  # tasks under "Planned next" — what to take on
+    blocked: list[str]  # tasks under "Blocked"
     error: str | None = None
 
 
@@ -111,31 +113,38 @@ async def _probe_commits(repo: Path, since: datetime) -> CommitsBlock:
 
 
 async def _probe_roadmap(repo: Path, since: datetime) -> RoadmapBlock:
-    """Look at ``notes/ROADMAP.md`` — count "In progress" entries now,
-    and find tasks moved into Done in the last 24h via ``git log -p``."""
+    """Parse ``notes/ROADMAP.md`` and ``git log -p`` over the last 24h.
+
+    Surfaces:
+    - count of currently-in-progress tasks
+    - tasks moved into Done (deduped by task id, not full line)
+    - what's at the top of "Planned next" — what to take on
+    - what's "Blocked" — needs unblocking before progress
+    """
     roadmap = repo / "notes" / "ROADMAP.md"
     if not roadmap.exists():
-        return RoadmapBlock(0, [], error="ROADMAP.md missing")
+        return RoadmapBlock(0, [], [], [], error="ROADMAP.md missing")
 
-    # Count current in-progress lines: rows in the In-progress section
-    # that look like a task table row (start with `|` and have an md link).
     try:
         text = roadmap.read_text(encoding="utf-8")
     except OSError as e:
-        return RoadmapBlock(0, [], error=str(e))
+        return RoadmapBlock(0, [], [], [], error=str(e))
 
-    in_progress = 0
-    in_section = False
-    for line in text.splitlines():
-        s = line.strip()
-        if s.startswith("##"):
-            in_section = "in progress" in s.lower() or "🔥" in s
-            continue
-        if in_section and s.startswith("|") and "tasks/" in s and "---" not in s:
-            in_progress += 1
+    sections = _split_sections(text)
+    in_progress = sum(1 for _ in _iter_table_rows(sections.get("in_progress", "")))
+    # "Можно взять дальше" — Planned next first, then fall back to Backlog.
+    # Often `Planned next` is empty as a roadmap convention, the real
+    # candidates list lives in Backlog.
+    next_up_rows = list(_iter_table_rows(sections.get("planned", "")))
+    if not next_up_rows:
+        next_up_rows = list(_iter_table_rows(sections.get("backlog", "")))
+    next_up = [_format_row(row) for row in next_up_rows][:5]
+    blocked = [_format_row(row) for row in _iter_table_rows(sections.get("blocked", ""))][:5]
 
-    # Find newly-Done tasks via git diff for ROADMAP.md over the window.
-    new_done: list[str] = []
+    # Newly-Done tasks via git diff for ROADMAP.md over the window.
+    # Dedup by task id (#NNNN) — repeated edits to the same row in the
+    # window must not produce duplicate entries.
+    by_id: dict[str, str] = {}
     try:
         diff = await _run(
             "git",
@@ -148,26 +157,74 @@ async def _probe_roadmap(repo: Path, since: datetime) -> RoadmapBlock:
             "--",
             "notes/ROADMAP.md",
         )
-        # Naive scan: ``+ | [0017](tasks/0017-foo.md) | Title | 2026-... |``
-        # represents a Done-table addition. We don't care about exact
-        # column positions, just want to surface task numbers / titles.
         for line in diff.splitlines():
             if not line.startswith("+") or line.startswith("+++"):
                 continue
             m = re.search(r"\[(\d{4})\]\([^)]+\)\s*\|\s*([^|]+?)\s*\|", line)
-            if m:
-                new_done.append(f"#{m.group(1)} {m.group(2).strip()}")
+            if not m:
+                continue
+            tid, title = m.group(1), m.group(2).strip()
+            # Keep the FIRST occurrence per task id — usually the most
+            # complete title; later edits often shorten or rephrase.
+            by_id.setdefault(tid, f"#{tid} {title}")
     except _ProbeFailed as e:
-        return RoadmapBlock(in_progress, [], error=e.detail)
+        return RoadmapBlock(in_progress, [], next_up, blocked, error=e.detail)
 
-    # Dedup preserving order.
-    seen = set()
-    deduped: list[str] = []
-    for item in new_done:
-        if item not in seen:
-            seen.add(item)
-            deduped.append(item)
-    return RoadmapBlock(in_progress, deduped[:5])
+    return RoadmapBlock(in_progress, list(by_id.values())[:5], next_up, blocked)
+
+
+def _split_sections(text: str) -> dict[str, str]:
+    """Group ROADMAP lines by section keyword.
+
+    Keys: ``in_progress``, ``planned``, ``backlog``, ``blocked``, ``done``.
+    Other sections are dropped (we don't surface them).
+    """
+    out: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("##"):
+            low = s.lower()
+            if "in progress" in low or "🔥" in s:
+                current = "in_progress"
+            elif "planned" in low or "📋" in s:
+                current = "planned"
+            elif "blocked" in low or "🚧" in s:
+                current = "blocked"
+            elif "done" in low or "✅" in s:
+                current = "done"
+            elif "backlog" in low or "💤" in s:
+                current = "backlog"
+            else:
+                current = None
+            continue
+        if current is None:
+            continue
+        out.setdefault(current, []).append(line)
+    return {k: "\n".join(v) for k, v in out.items()}
+
+
+def _iter_table_rows(section: str) -> Iterator[str]:
+    """Yield raw markdown rows that look like a task table row."""
+    for line in section.splitlines():
+        s = line.strip()
+        if not s.startswith("|"):
+            continue
+        if "---" in s:  # table separator
+            continue
+        if "tasks/" not in s:  # not a task row
+            continue
+        yield s
+
+
+def _format_row(row: str) -> str:
+    """Pull "#NNNN Title" out of a markdown table row."""
+    m = re.search(r"\[(\d{4})\]\([^)]+\)\s*\|\s*([^|]+?)\s*\|", row)
+    if m:
+        return f"#{m.group(1)} {m.group(2).strip()}"
+    # Fallback: trim the leading | and take first cell.
+    parts = [p.strip() for p in row.strip("|").split("|") if p.strip()]
+    return parts[0] if parts else "?"
 
 
 async def _probe_health() -> HealthBlock:
@@ -250,12 +307,34 @@ def _render(
     if roadmap.error:
         out.append(f"🗺 ROADMAP: <i>{escape(roadmap.error)}</i>")
     else:
-        line = f"🗺 ROADMAP: {roadmap.in_progress} в работе"
-        if roadmap.new_done:
-            line += f", закрыто {len(roadmap.new_done)}"
-        out.append(line)
+        # Headline: how the day looks at a glance.
+        if roadmap.in_progress == 0 and not roadmap.new_done and not roadmap.next_up:
+            out.append("🗺 ROADMAP: пусто — добавь задач")
+        else:
+            head_parts = []
+            head_parts.append(
+                f"{roadmap.in_progress} в работе"
+                if roadmap.in_progress
+                else "в работе пусто"
+            )
+            if roadmap.new_done:
+                head_parts.append(f"закрыто {len(roadmap.new_done)}")
+            out.append(f"🗺 ROADMAP: {', '.join(head_parts)}")
+
         for d in roadmap.new_done:
             out.append(f"  ✅ {escape(d)}")
+
+        if roadmap.next_up:
+            out.append("")
+            out.append("🎯 Можно взять дальше:")
+            for n in roadmap.next_up:
+                out.append(f"  · {escape(n)}")
+
+        if roadmap.blocked:
+            out.append("")
+            out.append("🚧 Заблокировано:")
+            for b in roadmap.blocked:
+                out.append(f"  · {escape(b)}")
 
     # ── Health
     out.append("")

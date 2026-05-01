@@ -88,8 +88,11 @@ async def cmd_help(message: Message) -> None:
         "<code>/menu</code>    — inline-клавиатура быстрых действий\n"
         "<code>/digest</code>  — утренний дайджест (commits, ROADMAP, прод, ошибки)\n"
         "<code>/status</code>  — текущая папка, session id, модель, betas\n"
-        "<code>/reset</code>   — забыть разговор, следующее сообщение начнёт с чистого\n"
+        "<code>/reset</code>   — забыть разговор; перед стиранием сохранит summary\n"
         "<code>/compact</code> — ужать историю в summary, контекст продолжается\n"
+        "<code>/history</code> — список сохранённых сессий\n"
+        "<code>/show &lt;id&gt;</code> — открыть сохранённый summary\n"
+        "<code>/resume &lt;id&gt;</code> — стартовать с этим контекстом\n"
         "<code>/cancel</code>  — прервать текущий ход (best-effort)\n"
         "<code>/cd &lt;path&gt;</code> — сменить рабочую директорию Claude\n"
         "<code>/help</code>    — это сообщение\n\n"
@@ -132,9 +135,21 @@ async def cmd_status(message: Message) -> None:
 
 @router.message(Command("reset"))
 async def cmd_reset(message: Message) -> None:
-    sess = get_or_create_session(message.chat.id, message.bot)  # type: ignore[arg-type]
-    await sess.reset()
-    await message.answer("🔄 Сессия сброшена.")
+    bot = message.bot
+    assert bot is not None
+    sess = get_or_create_session(message.chat.id, bot)
+    # Tell the user we're working — the compact-before-wipe takes a few seconds.
+    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    saved_title = await sess.reset()
+    if saved_title:
+        text = (
+            "🔄 Сессия сброшена.\n"
+            f"📚 Сохранил summary: <i>{html.escape(saved_title)}</i>\n"
+            "Вернуться: <code>/history</code>"
+        )
+    else:
+        text = "🔄 Сессия сброшена."
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("cancel"))
@@ -142,6 +157,109 @@ async def cmd_cancel(message: Message) -> None:
     sess = get_or_create_session(message.chat.id, message.bot)  # type: ignore[arg-type]
     sess.request_cancel()
     await message.answer("⏹ Прерываю — придёт результат того, что успел.")
+
+
+@router.message(Command("history"))
+async def cmd_history(message: Message) -> None:
+    """List archived session summaries — most recent first.
+
+    Each entry shows: ``• DD.MM HH:MM — title`` plus a tap-to-resume
+    inline button. Tapping opens that summary; an explicit /resume
+    starts a new session pre-loaded with it.
+    """
+    from app.history import list_history
+
+    entries = list_history(message.chat.id)
+    if not entries:
+        await message.answer(
+            "📚 История пуста — она наполняется при <code>/reset</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    lines = ["📚 <b>История сессий</b> (новые сверху):", ""]
+    for entry in entries:
+        # Use the user's local timezone for display (Europe/Minsk in our case).
+        local = entry.created_at.astimezone()
+        when = local.strftime("%d.%m %H:%M")
+        lines.append(
+            f"• <code>{entry.entry_id}</code> · {when}\n"
+            f"  <i>{html.escape(entry.title)}</i>"
+        )
+    lines.append("")
+    lines.append(
+        "Открыть: <code>/show &lt;id&gt;</code>\n"
+        "Возобновить как контекст: <code>/resume &lt;id&gt;</code>"
+    )
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("show"))
+async def cmd_show(message: Message, command: CommandObject) -> None:
+    """Print a saved summary in full."""
+    from app.history import load_summary
+
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/show 20260501T203000Z</code> "
+            "(id из <code>/history</code>)",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    entry_id = command.args.strip().split()[0]
+    text = load_summary(message.chat.id, entry_id)
+    if text is None:
+        await message.answer(
+            f"❌ Не нашёл запись <code>{html.escape(entry_id)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    # Fits in a TG message in 99% of cases (we cap summaries at 32KB).
+    # If somehow doesn't — let chunker handle it.
+    chunks = chunk_text(text)
+    for chunk in chunks:
+        await message.answer(chunk)
+
+
+@router.message(Command("resume"))
+async def cmd_resume(message: Message, command: CommandObject) -> None:
+    """Start a fresh session seeded with a saved summary as context.
+
+    Differs from /reset+manual: Claude starts with the summary already
+    loaded, so you can pick up "from where we left off" without copying
+    text yourself.
+    """
+    from app.history import load_summary
+
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/resume 20260501T203000Z</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    bot = message.bot
+    assert bot is not None
+    entry_id = command.args.strip().split()[0]
+    summary = load_summary(message.chat.id, entry_id)
+    if summary is None:
+        await message.answer(
+            f"❌ Не нашёл запись <code>{html.escape(entry_id)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    sess = get_or_create_session(message.chat.id, bot)
+    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    try:
+        await sess.seed_with_summary(summary)
+    except Exception as e:  # noqa: BLE001
+        await message.answer(f"⚠️ Не получилось зарядить контекст: {html.escape(str(e))}")
+        return
+    await message.answer(
+        f"♻️ Возобновил контекст из <code>{html.escape(entry_id)}</code>.\n"
+        "Можно продолжать с этого места.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(Command("digest"))
