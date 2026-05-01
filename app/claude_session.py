@@ -318,16 +318,38 @@ def _format_tool_call(block: ToolUseBlock) -> str:
 
 
 def _system_prompt() -> str:
-    """Append a short note on top of Claude Code's preset.
+    """System prompt nudges layered on top of Claude Code's preset.
 
-    The default preset already pulls in CLAUDE.md / notes/* from cwd,
-    so we don't repeat conventions here — just nudge the assistant
-    about the unusual transport (Telegram).
+    The default preset already loads ``CLAUDE.md`` / ``notes/*`` from
+    cwd, so we don't repeat conventions here. We DO override two
+    behaviors that matter over Telegram:
+
+    1) **No tool-use on conversational input.** Claude Code's default
+       leans heavily on file exploration even for chit-chat
+       ("how are you", "what model are you", "проверь, ты работаешь?").
+       Over TG that means 30 seconds of latency and 8+ tool calls
+       before the user gets a one-word answer. We tell Claude to answer
+       chit-chat directly.
+
+    2) **Lean output.** No tables, no code-fences for trivial things,
+       no "I'll now…" preambles. The transport is lossy (chunked at
+       3500 chars) and slow (typing animation). Density wins.
     """
     return (
-        "Ты работаешь на VPS, общаешься с пользователем через Telegram-бота."
-        " Длинные простыни выводятся плохо — дави на лаконичность,"
-        " а большие куски кода пиши в файлы, не цитируй обратно в чат."
-        " Когда работа завершена и есть, что показать — дай короткое"
-        " резюме того, что сделал, и предложи следующий шаг."
+        "Ты работаешь на VPS, общаешься с пользователем через Telegram-бота. "
+        "Транспорт медленный (typing-animation, лимит 3500 символов на "
+        "сообщение), поэтому КРАТКОСТЬ — приоритет.\n\n"
+        "ПРАВИЛА:\n"
+        "1. На разговорные сообщения ('как дела', 'ты работаешь?', 'какая ты "
+        "модель', 'что ты можешь', проверочные вопросы про сам бот) "
+        "отвечай ОДНОЙ-ДВУМЯ строками БЕЗ tool-use. Не читай файлы, не "
+        "лазь в git, не запускай grep — просто отвечай словами.\n"
+        "2. Tool-use оправдан только когда явно просят что-то СДЕЛАТЬ "
+        "с проектом ('покажи статус', 'почини X', 'добавь Y', 'пробеги "
+        "тесты'). Даже тогда — минимум tool-calls.\n"
+        "3. Большие куски кода/diff'ов выводи в файлы через Write, не "
+        "цитируй обратно в чат.\n"
+        "4. Без 'I'll now do X' преамбул — сразу делай или сразу отвечай.\n"
+        "5. Когда задача завершена, дай ОДНО предложение результата "
+        "и опционально следующий шаг."
     )
