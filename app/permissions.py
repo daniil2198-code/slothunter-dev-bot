@@ -159,23 +159,36 @@ SAFE_BASH_COMMANDS: frozenset[str] = frozenset(
         # File inspection
         "ls", "cat", "head", "tail", "wc", "file", "stat",
         "pwd", "tree", "find", "du", "df",
+        # File move / create — safe-ish: ``mv`` and ``cp`` can clobber,
+        # but in our flow they're used for moving artifacts (logs,
+        # patches, screenshots) not for blowing away source. ``rm`` is
+        # NOT included — destructive deletes go through the prompt.
+        "mkdir", "rmdir", "touch", "cp", "mv", "ln", "chmod", "chown",
+        # Archives — read or create is safe; extract can clobber but
+        # ``tar -xf foo.tar -C dir`` is normal post-deploy flow.
+        "tar", "gzip", "gunzip", "bzip2", "bunzip2", "zip", "unzip",
         # Text inspection
         "grep", "rg", "ag", "sort", "uniq", "diff",
         "echo", "printf", "true", "false",
-        # Git read-only
-        "git",  # filtered further by subcommand below
+        # Git read-only + commit/amend/restore (filtered by subcommand below)
+        "git",
         # Python tooling read-only
         "python", "python3", "uv",  # uv has destructive subcommands; filtered
         "pytest", "ruff", "mypy", "pyright",
         # Node tooling read-only
         "node", "npm", "npx",  # filtered by sub
+        # Build runner — `make <target>` is whatever Makefile defines.
+        # In our repos targets are read/lint/test/format/dev-up — all safe;
+        # if someone adds a destructive target, that's a Makefile policy,
+        # not a bash policy. Pragmatic call: skip the prompt on `make`.
+        "make",
         # System inspect
         "ps", "top", "free", "uptime", "whoami", "id", "uname",
         "env", "which", "type", "command",
         "date", "hostname",
         # Docker inspect
         "docker",  # filtered by sub
-        "systemctl",  # filtered by sub
+        "systemctl",  # filtered by sub — incl. restart/reload
         "journalctl",
         "curl", "wget",  # technically network — but read-only by default
     }
@@ -184,23 +197,63 @@ SAFE_BASH_COMMANDS: frozenset[str] = frozenset(
 # Subcommand allowlists for tools that have both safe and destructive
 # operations. Only the listed subcommands auto-approve — anything else
 # falls through to the manual prompt.
+#
+# Policy for the day-to-day flow (commit / amend / restart / sync deps):
+# auto-approve everything that's reversible from local history. The line
+# we don't cross without explicit consent: ``push`` (touches remote, can
+# be force-pushed elsewhere later), ``rebase`` / ``merge --no-ff`` /
+# anything that rewrites history beyond the most recent commit.
 SAFE_GIT_SUBCOMMANDS = frozenset(
     {
+        # Read-only inspection.
         "status", "log", "diff", "show", "blame",
         "branch", "tag", "remote", "config",
         "ls-files", "ls-tree", "rev-parse", "rev-list",
         "describe", "shortlog", "reflog",
-        "fetch", "pull", "stash",  # mutate but recoverable
+        # Mutate but cheap-to-recover (worktree only, no remote, no
+        # history rewrite).
+        "fetch", "pull", "stash",
+        "add", "restore", "checkout",
+        "commit",  # incl. --amend; amending unpushed commits is normal flow
+        "mv", "rm",  # tracked-file ops; bash-level rm is filtered separately
+        "format-patch", "am", "apply", "bundle",
+        "cherry-pick", "revert",
+        "init", "clone",
     }
 )
 SAFE_DOCKER_SUBCOMMANDS = frozenset(
     {"ps", "logs", "inspect", "images", "volume", "network", "stats", "top", "version", "info"}
 )
+# systemctl: status/inspect AND restart/reload/start/stop. The bot
+# routinely restarts itself / slot-hunter services after deploys; we
+# can't have it ask on every cycle. Disabling / masking units is still
+# manual — those persist beyond the current process and shouldn't be
+# silent.
 SAFE_SYSTEMCTL_SUBCOMMANDS = frozenset(
-    {"status", "is-active", "is-enabled", "list-units", "list-unit-files", "show", "cat"}
+    {
+        "status", "is-active", "is-enabled", "list-units",
+        "list-unit-files", "show", "cat",
+        "restart", "reload", "start", "stop", "try-restart",
+        "daemon-reload",
+    }
 )
-SAFE_NPM_SUBCOMMANDS = frozenset({"list", "ls", "view", "outdated", "audit", "version", "help"})
-SAFE_UV_SUBCOMMANDS = frozenset({"run", "tree", "version", "help"})
+# npm: install/uninstall are routine for dev-bot deps; "rm/uninstall"
+# remove a package which is recoverable via package-lock + reinstall.
+SAFE_NPM_SUBCOMMANDS = frozenset(
+    {
+        "list", "ls", "view", "outdated", "audit", "version", "help",
+        "install", "i", "ci", "update",
+    }
+)
+# uv: sync / add / remove are how dependencies get touched. lock writes
+# uv.lock — recoverable from git. Everything destructive (clean cache)
+# stays manual.
+SAFE_UV_SUBCOMMANDS = frozenset(
+    {
+        "run", "tree", "version", "help",
+        "sync", "add", "remove", "lock", "pip", "tool",
+    }
+)
 SAFE_NODE_SUBCOMMANDS: frozenset[str] = frozenset()  # `node script.js` arbitrary code → ask
 SAFE_PYTHON_SUBCOMMANDS: frozenset[str] = frozenset()  # same
 
