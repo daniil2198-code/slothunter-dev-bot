@@ -8,6 +8,7 @@ import contextlib
 from app.bot import build_bot, build_dispatcher
 from app.logging import configure_logging, get_logger
 from app.scheduler import build_scheduler
+from app.triggers import ensure_trigger_dir
 
 
 async def amain() -> None:
@@ -17,6 +18,11 @@ async def amain() -> None:
     bot = build_bot()
     dp = build_dispatcher()
     scheduler = build_scheduler(bot)
+
+    # Make sure the trigger queue dir exists before either the
+    # scheduler watcher or any external producer (deploy.sh) tries to
+    # use it.
+    ensure_trigger_dir()
 
     me = await bot.get_me()
     log.info("bot_started", username=me.username, id=me.id)

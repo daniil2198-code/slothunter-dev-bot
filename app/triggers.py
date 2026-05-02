@@ -41,6 +41,21 @@ def _trigger_dir() -> Path:
     return settings.state_dir / "triggers"
 
 
+def ensure_trigger_dir() -> Path:
+    """Create the trigger dir if missing. Idempotent.
+
+    Called on bot startup so external producers (deploy.sh) can rely
+    on the dir existing without each one mkdir'ing it themselves. Also
+    chmods to 0o700 since the dir contains queued prompts that may
+    reference dev-tokens / project paths.
+    """
+    d = _trigger_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        d.chmod(0o700)
+    return d
+
+
 async def process_pending_triggers(bot: Bot) -> None:
     """Drain the trigger directory.
 
