@@ -174,9 +174,17 @@ status, journalctl, …).
 navigate, snapshot, screenshot, console_messages, network_requests,
 click, type, fill, drag, hover.
 
-**Спрашивает inline-кнопкой:** любой Bash вне whitelist'а, WebFetch,
-WebSearch, Task, MCP-tools (`browser_evaluate`,
+**Спрашивает inline-кнопкой (вне YOLO):** любой Bash вне whitelist'а,
+WebFetch, WebSearch, Task, MCP-tools (`browser_evaluate`,
 `browser_run_code_unsafe`).
+
+**В `/yolo on`** все эти gates снимаются — auto-approve. Остаётся
+только catastrophic safety net (см. ниже). Логика: bash в YOLO уже
+открыт, гейтить sandbox-JS (`browser_evaluate`) или Node-RCE
+(`run_code_unsafe`, тот же процесс что Claude и так контролирует) —
+непоследовательно. Каждое срабатывание YOLO логируется
+(`yolo_auto_approved` в `journalctl -u dev-bot`) — audit-trail
+сохраняется.
 
 **Деструктивный bash** получает ⚠️ в запросе: `rm -rf`,
 `git push --force`, `git reset --hard`, `DROP TABLE`, `TRUNCATE`,

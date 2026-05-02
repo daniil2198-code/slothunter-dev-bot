@@ -510,9 +510,18 @@ def make_can_use_tool(
     we return Allow for every tool **without** asking. This works
     under root, where the SDK's own ``permission_mode="bypassPermissions"``
     refuses to run (Claude CLI hardcodes a no-bypass-as-root sanity check).
-    Catastrophic bash patterns (``rm -rf /``, ``dd``, forkbomb, etc.)
-    still go through the broker — even in autopilot the user gets one
-    last chance to bail.
+
+    Only one gate remains in YOLO: catastrophic bash patterns (``rm -rf /``,
+    ``dd``, forkbomb, etc.) still go through the broker — even in autopilot
+    the user gets one last chance to bail.
+
+    Browser ``evaluate`` / ``run_code_unsafe`` (which require a tap in
+    normal mode) auto-approve in YOLO. Reasoning: ``browser_evaluate`` is
+    sandboxed to the page context (no FS access, no network beyond what
+    the page does); ``run_code_unsafe`` runs in the same Node process
+    Claude already controls via Bash. Both are strictly less powerful
+    than the bash YOLO already grants — gating JS while bash is open
+    is inconsistent.
 
     The provider is called on every tool invocation, so toggling
     ``/yolo on|off`` takes effect on the very next tool call without a
@@ -539,9 +548,11 @@ def make_can_use_tool(
             if len(parts) == 3:
                 local_name = parts[2]
 
-        # YOLO short-circuit. Order: catastrophic-check, then auto-allow.
-        # Browser MCP "always ask" patterns also bypass YOLO — those are
-        # Claude-running-arbitrary-JS, dangerous regardless of mode.
+        # YOLO short-circuit. Only catastrophic-bash escapes auto-allow.
+        # Browser ``evaluate`` / ``run_code_unsafe`` are auto-approved here:
+        # they're strictly less powerful than the bash YOLO already grants
+        # (sandboxed JS / same-process Node), so gating them while bash
+        # is wide open would just be theatrical friction.
         is_yolo = yolo() if yolo is not None else False
         if is_yolo:
             if tool_name == "Bash":
@@ -555,16 +566,6 @@ def make_can_use_tool(
                         message=reason or "Отклонено пользователем",
                         interrupt=False,
                     )
-            if local_name in _BROWSER_ALWAYS_ASK:
-                # browser_evaluate / run_code_unsafe — same risk as
-                # arbitrary JS, ask even in YOLO.
-                allowed, reason = await broker.request(tool_name, tool_input)
-                if allowed:
-                    return PermissionResultAllow(updated_input=tool_input)
-                return PermissionResultDeny(
-                    message=reason or "Отклонено пользователем",
-                    interrupt=False,
-                )
             log.info("yolo_auto_approved", tool=tool_name)
             return PermissionResultAllow(updated_input=tool_input)
 
