@@ -17,10 +17,12 @@ from typing import TYPE_CHECKING
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import settings
 from app.digest import send_digest
 from app.logging import get_logger
+from app.triggers import process_pending_triggers
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -70,6 +72,30 @@ def build_scheduler(bot: Bot) -> AsyncIOScheduler:
         replace_existing=True,
     )
     log.info("scheduler_digest_armed", hour=hh, minute=mm, tz=TZ)
+
+    # ─────────── File-based triggers (M3.4b) ───────────
+    # Poll state_dir/triggers/ once a minute. Other processes
+    # (currently slot-hunter's deploy.sh) drop *.txt files there to
+    # ask the bot to run a Claude turn. See app/triggers.py.
+    async def _process_triggers() -> None:
+        try:
+            await process_pending_triggers(bot)
+        except Exception:  # noqa: BLE001
+            log.exception("trigger_loop_crashed")
+
+    sched.add_job(
+        _process_triggers,
+        IntervalTrigger(minutes=1),
+        id="trigger-watcher",
+        name="trigger-watcher: drain state_dir/triggers/",
+        replace_existing=True,
+        # Skip a tick if the previous run is still going — avoids
+        # piling up runs when a turn takes longer than the interval.
+        max_instances=1,
+        coalesce=True,
+    )
+    log.info("scheduler_trigger_watcher_armed")
+
     return sched
 
 

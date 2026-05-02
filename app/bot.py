@@ -157,7 +157,10 @@ _HELP_COMMANDS = (
     "<code>/menu</code>    — inline-клавиатура (Status / Diff / Tests / "
     "Deploy / Roadmap / Logs)\n"
     "<code>/digest</code>  — утренний дайджест по запросу (commits, ROADMAP, "
-    "прод, ошибки). Сам приходит каждый день в 09:00 Минск.\n\n"
+    "прод, ошибки). Сам приходит каждый день в 09:00 Минск.\n"
+    "<code>/test</code>    — без аргументов список e2e-сценариев, "
+    "<code>/test &lt;name&gt;</code> прогон через Playwright + Mini App "
+    "с dev-токеном.\n\n"
     "<code>/help</code>    — этот текст"
 )
 
@@ -396,6 +399,82 @@ async def cmd_resume(message: Message, command: CommandObject) -> None:
         "Можно продолжать с этого места.",
         parse_mode=ParseMode.HTML,
     )
+
+
+@router.message(Command("test"))
+async def cmd_test(message: Message, command: CommandObject) -> None:
+    """Run an E2E scenario from ``notes/e2e/`` against the prod Mini App.
+
+    ``/test`` (no args) — list available scenarios.
+    ``/test <name>`` — Claude reads ``notes/e2e/<name>.md`` and executes
+    it via Playwright MCP, then reports PASS/FAIL with evidence.
+
+    Sets a 5-minute soft budget by request — browser scenarios that run
+    longer are almost always stuck; user can /cancel to bail. Multi-step
+    flows like full wizard runs sit comfortably under 2 min.
+    """
+    bot = message.bot
+    assert bot is not None
+    chat_id = message.chat.id
+
+    # Scenarios live in the slot-hunter project, not in dev-bot. Use
+    # the configured workdir (which IS slot-hunter).
+    scenarios_dir = settings.default_workdir / "notes" / "e2e"
+    if not scenarios_dir.is_dir():
+        await message.answer(
+            f"❌ Не нашёл сценариев: <code>{html.escape(str(scenarios_dir))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    scenarios = sorted(p.stem for p in scenarios_dir.glob("*.md") if p.stem != "README")
+
+    if not command.args:
+        if not scenarios:
+            await message.answer("Сценариев нет — добавь файлы в notes/e2e/")
+            return
+        listing = "\n".join(f"• <code>/test {s}</code>" for s in scenarios)
+        await message.answer(
+            f"🧪 <b>Доступные сценарии</b>\n\n{listing}\n\n"
+            "Без аргументов — этот список. С именем — прогон.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    name = command.args.strip().split()[0]
+    target = scenarios_dir / f"{name}.md"
+    if not target.is_file():
+        await message.answer(
+            f"❌ Сценарий <code>{html.escape(name)}</code> не найден. "
+            "Список — <code>/test</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Build the prompt for Claude. Explicit and short — Claude already
+    # knows about Playwright via the system prompt, the scenario file
+    # itself describes what to do.
+    prompt = (
+        f"Прогон e2e-сценария.\n\n"
+        f"1. Прочитай файл: {target}\n"
+        f"2. Выполни его шаги через Playwright MCP.\n"
+        f"3. По итогу дай вердикт: **PASS** или **FAIL** одной строкой "
+        f"вверху ответа, потом краткие наблюдения и ссылки на скриншоты.\n\n"
+        f"Если что-то пошло не по плану и ты не уверен в трактовке — "
+        f"всё равно вынеси PASS/FAIL и объясни сомнения."
+    )
+    sess = get_or_create_session(chat_id, bot)
+    await bot.send_chat_action(chat_id, ChatAction.TYPING)
+    log.info("e2e_test_start", chat_id=chat_id, scenario=name)
+    reply = await sess.query(prompt)
+    log.info(
+        "e2e_test_done",
+        chat_id=chat_id,
+        scenario=name,
+        cancelled=reply.cancelled,
+        error=bool(reply.error),
+    )
+    await _send_reply(bot, chat_id, reply)
 
 
 @router.message(Command("digest"))

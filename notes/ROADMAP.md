@@ -16,112 +16,52 @@
 - ✅ Opus 4.7 + 1M context window
 - ✅ systemd unit + `scripts/deploy.sh`
 - ✅ **M1** — утренний дайджест в 09:00 (commits / ROADMAP / прод / логи) + `/digest`
+- ✅ **M1.5** — voice через Groq Whisper (handler в боте, env уже стояли)
 - ✅ **M2** — `/history`, `/show`, `/resume` — журнал разговоров с автосохранением summary при `/reset`
+- ✅ **M3.1** — Playwright MCP подключён, browser_* tools работают, скриншоты авто-приходят
+- ✅ **M3.2** — dev-token bypass для Mini App (см. slot-hunter `app/api/deps.py`), Claude видит реальные данные
+- ✅ **M3.3** — e2e-сценарии в `slot-hunter/notes/e2e/` (home, paywall, api-health)
+- ✅ **M3.4** — `/test [<scenario>]` команда + file-based триггер для авто-теста после деплоя
 
 ## 🔥 Planned next
 
-### M1.5 — Voice transcription через Groq
-**Статус:** в работе пользователем (env-переменные `GROQ_API_KEY`,
-`GROQ_WHISPER_MODEL=whisper-large-v3-turbo`, `VOICE_MAX_DURATION_SEC` уже
-проставлены на VPS). Осталось — handler.
+### M3.5 — Регрессия скриншотов (визуальный baseline)
+**Цель:** ловить визуальные регрессии без участия человека. После
+первого прогона e2e-сценария сохраняем «эталонные» скриншоты как
+baseline; на повторных прогонах сравниваем по пикселям, расхождения
+выше порога — фейлим тест с приложенным diff-overlay.
 
-**Что делать:**
-- В `app/bot.py` на `F.voice` (заменить existing «не поддерживается»):
-  - скачать `voice.file_id` через `bot.download_file`
-  - проверить `duration <= VOICE_MAX_DURATION_SEC`
-  - POST в `https://api.groq.com/openai/v1/audio/transcriptions`,
-    multipart с `file=<bytes>`, `model=whisper-large-v3-turbo`,
-    `language=ru`, `response_format=text`
-  - получить текст → передать в `sess.query(text)` как обычное сообщение
+**Что нужно:**
+- Папка `slot-hunter/notes/e2e/baseline/<scenario>/<step>.png` —
+  эталонные скриншоты, под git.
+- Команда `/test --update-baseline <name>` — пересохраняет эталоны
+  (для сознательных UI-изменений).
+- В каждом сценарии — указать какие скриншоты считать baseline'ом
+  (имена/селекторы).
+- Pixel-diff через Pillow или OpenCV — настраиваемый порог (`5%`
+  default), визуализация diff-overlay в файле, бот аттачит.
 
-**Срок:** ~30 мин.
+**Зачем не сегодня:**
+- Pixel-diff — rabbit hole с false-positives на anti-aliasing,
+  виртуальном курсоре, рандомных гифках. Лучше дать M3.1-3.4
+  отстояться неделю и понять, какие сценарии реально надо защищать
+  визуально.
+- `M3.4` плюс ручная проверка скриншотов через TG-чат уже даёт 80%
+  ценности.
 
-### M3 — Автономное тестирование Mini App
-**Цель:** Claude сам кликает, проверяет инварианты, читает консоль —
-без открытия Mini App в Telegram руками.
+**Срок:** ~2-3 часа когда дойдёт.
 
-После каждого деплоя сейчас приходится открывать `mini.slothunter.space`
-в Telegram, гонять wizard, смотреть что не сломалось. С M3 — пишешь
-боту «протестируй последний деплой» → он сам всё делает.
+### Критичные риски M3 (что мониторить)
 
-**Архитектура:**
-
-```
-TG → dev-bot → Claude (Opus 4.7)
-                 │
-                 ├─→ Read/Edit/Write/Bash (как сейчас)
-                 ├─→ Playwright MCP (новое)
-                 │     ├─ browser_navigate, browser_click,
-                 │     │  browser_type, browser_snapshot,
-                 │     │  browser_take_screenshot
-                 │     ├─ browser_console_messages, browser_network_requests
-                 │     └─ работает на VPS (headless Chromium)
-                 └─→ Mini App backend (REST через Bash + curl)
-```
-
-**Этапы:**
-
-1. **Playwright MCP подключён к Claude в dev-боте.** ~2-3 часа.
-   - В `ClaudeAgentOptions` добавить
-     `mcp_servers={"playwright": {"command": "npx", "args": ["-y",
-     "@playwright/mcp"]}}`.
-   - На VPS установить `npx` зависимости + `npx playwright install
-     chromium --with-deps` (системные шрифты, кодеки).
-   - Прокинуть `playwright_*` tools через `can_use_tool` —
-     `browser_navigate`, `browser_take_screenshot` auto-approve;
-     `browser_evaluate`, `browser_run_code_unsafe` спрашивают.
-   - Smoke-тест: бот может зайти на `mini.slothunter.space` и сделать
-     скриншот → ответить картинкой в чат. **Это закрывает изначальный
-     M4 «скриншот после деплоя» бесплатно.**
-
-2. **Dev-mode auth для Mini App.** ~1 час.
-   - В `app/api/auth.py` добавить bypass: если в URL есть
-     `?dev_token=<env DEV_TOKEN>` И `settings.app_env == "development"
-     | "test"`, считаем юзером `ALLOWED_USER_ID`.
-   - Без этого Playwright не пройдёт Telegram WebApp HMAC-валидацию.
-   - **Никогда** не активировать в продовом env — гард по `app_env`.
-   - Опц.: ограничить bypass per-IP (только loopback) если хочется
-     защититься от случайного `app_env=test` на проде.
-
-3. **Test-scenarios как YAML или Markdown.** ~3 часа.
-   - Папка `tests/e2e/scenarios/` в slot-hunter:
-     - `wizard-rw-by-create-alert.yml` — Минск → Витебск, дата
-       завтра, выбрать поезд, сохранить, проверить что в `/api/alerts`
-       появилось.
-     - `wizard-atlas-create-alert.yml` — Минск → Брест, дата, рейс,
-       сохранить.
-     - `paywall.yml` — после 1 алерта попытка создать второй =
-       402 + баннер «Подписка».
-     - `mini-app-loads.yml` — открыть, проверить что сервис-карточки
-       видны, лого видно, нет console errors.
-   - Формат: декларативный список шагов («click selector», «type
-     value», «assert text contains», «assert network 200 to URL pattern»).
-   - Claude читает scenario как часть промпта и через Playwright tools
-     прогоняет.
-
-4. **Команда `/test` в боте + auto-test после deploy.** ~1 час.
-   - `/test` без аргументов — прогон всех scenarios, отчёт в чат.
-   - `/test <name>` — конкретный сценарий.
-   - В `slot-hunter/scripts/deploy.sh` после успеха —
-     `curl -X POST $DEV_BOT/test-trigger` (новый webhook в dev-боте).
-     Бот прогоняет smoke-suite, репортит что прошло / упало.
-
-5. **Регрессия скриншотов (опц.).** ~2 часа.
-   - При первом прогоне scenario сохраняет «эталонные» скриншоты в
-     `tests/e2e/baseline/`.
-   - На последующих прогонах — pixel-diff. Расхождения > N% — падает
-     с прикреплённой картинкой и diff-overlay.
-
-**Срок:** ~7-9 часов суммарно. Делается после M1/M2.
-
-**Критичные riski:**
-- Playwright headless Chromium тяжёлый — на 4GB VPS будет жить рядом
-  с Postgres / Redis / API / dev-bot. При прогоне 5-10 сценариев в
-  параллель может OOM. Защита: gate в Claude что больше 1 сценария
-  одновременно не запускать.
-- TG WebApp `initData` HMAC завязан на bot token. dev-mode bypass
-  МОЖЕТ случайно затечь в прод если ты вырубишь APP_ENV. Чек-лист
-  при включении: env-проверка + IP-binding + чёткое логирование.
+- **OOM на 4GB VPS.** Playwright headless Chromium ест ~300-500MB
+  per browser. Параллельные прогоны = сжигание памяти. Сейчас
+  `/test` сериализует через `_lock` сессии — больше 1 сценария
+  одновременно не уйдёт. Если будем добавлять параллельные тесты —
+  поставить семафор.
+- **Dev-token leak** через TG breadcrumbs. Закрыто `_redact_secrets`
+  в `claude_session.py`, но если добавятся новые места где Claude
+  цитирует URL — пройдись по ним и проверь, что redaction
+  применяется.
 
 ## 💤 Backlog
 
