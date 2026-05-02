@@ -19,6 +19,8 @@ Anything else (text, photos with captions) is forwarded to Claude.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import html
 import re
 import time
@@ -41,6 +43,7 @@ from app.chunker import chunk_text, is_too_long_for_messages
 from app.claude_session import ChatSession, StreamedReply
 from app.config import settings
 from app.logging import get_logger
+from app.md_to_tg import to_html as md_to_html
 from app.permissions import PermissionBroker
 
 log = get_logger(__name__)
@@ -58,6 +61,106 @@ def get_or_create_session(chat_id: int, bot: Bot) -> ChatSession:
         _sessions[chat_id] = sess
         _brokers[chat_id] = broker
     return sess
+
+
+# ─────────── Heartbeat / typing keep-alive ───────────
+
+# How long a turn must run before we surface a "still working…" status
+# message. Below this we just rely on the typing-action animation —
+# a status message for a 5-second turn is more noise than signal.
+_STATUS_AFTER_S = 25.0
+# Cadence at which we edit the status message. Telegram rate-limits
+# edit_message_text to about one edit per second per chat — 30s is
+# safe and matches the user's mental model of "it's checking in".
+_STATUS_INTERVAL_S = 30.0
+# Telegram's chat-action ("typing…") expires after ~5s. We refresh on
+# this cadence to keep it visible for the whole turn.
+_TYPING_REFRESH_S = 4.0
+
+
+async def _run_query_with_status(
+    bot: Bot,
+    chat_id: int,
+    sess: ChatSession,
+    prompt: str,
+) -> StreamedReply:
+    """Run ``sess.query(prompt)`` while keeping the user informed.
+
+    Two background tasks run for the duration of the query:
+
+    * **typing-keepalive** — re-sends ``ChatAction.TYPING`` every few
+      seconds so the native "печатает…" indicator stays on.
+    * **heartbeat** — after ``_STATUS_AFTER_S`` of work, sends one
+      status message and edits it every ``_STATUS_INTERVAL_S`` with
+      elapsed seconds + the most recent tool call. Deletes the message
+      when the turn ends so the chat stays clean.
+
+    Tool labels arrive via ``on_progress`` callback wired into the
+    SDK stream loop in ``claude_session._collect_reply``.
+    """
+    started = time.monotonic()
+    last_tool: dict[str, str | None] = {"label": None}
+
+    async def on_progress(label: str) -> None:
+        last_tool["label"] = label
+
+    async def typing_keepalive() -> None:
+        try:
+            while True:
+                with contextlib.suppress(Exception):
+                    await bot.send_chat_action(chat_id, ChatAction.TYPING)
+                await asyncio.sleep(_TYPING_REFRESH_S)
+        except asyncio.CancelledError:
+            raise
+
+    async def heartbeat() -> None:
+        try:
+            await asyncio.sleep(_STATUS_AFTER_S)
+            tool = last_tool["label"] or "думаю"
+            text = f"⏳ работаю… <i>{html.escape(tool)}</i>"
+            try:
+                msg = await bot.send_message(
+                    chat_id, text, parse_mode=ParseMode.HTML
+                )
+            except Exception as e:  # noqa: BLE001 — heartbeat is best-effort
+                log.debug("heartbeat_send_failed", error=str(e))
+                return
+            try:
+                while True:
+                    await asyncio.sleep(_STATUS_INTERVAL_S)
+                    elapsed = int(time.monotonic() - started)
+                    tool = last_tool["label"] or "думаю"
+                    new_text = (
+                        f"⏳ {elapsed}с — <i>{html.escape(tool)}</i>"
+                    )
+                    try:
+                        await bot.edit_message_text(
+                            new_text,
+                            chat_id=chat_id,
+                            message_id=msg.message_id,
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("heartbeat_edit_failed", error=str(e))
+                        return
+            except asyncio.CancelledError:
+                # On clean turn end, drop the status message — we don't
+                # want a forever-stale "⏳" lingering above the answer.
+                with contextlib.suppress(Exception):
+                    await bot.delete_message(chat_id, msg.message_id)
+                raise
+        except asyncio.CancelledError:
+            raise
+
+    typing_task = asyncio.create_task(typing_keepalive())
+    hb_task = asyncio.create_task(heartbeat())
+    try:
+        return await sess.query(prompt, on_progress=on_progress)
+    finally:
+        for task in (typing_task, hb_task):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
 
 # ─────────── Commands ───────────
@@ -618,9 +721,8 @@ async def cmd_test(message: Message, command: CommandObject) -> None:
         return
 
     sess = get_or_create_session(chat_id, bot)
-    await bot.send_chat_action(chat_id, ChatAction.TYPING)
     log.info("e2e_test_start", chat_id=chat_id, scenario=name)
-    reply = await sess.query(prompt)
+    reply = await _run_query_with_status(bot, chat_id, sess, prompt)
     log.info(
         "e2e_test_done",
         chat_id=chat_id,
@@ -658,8 +760,7 @@ async def cmd_compact(message: Message) -> None:
     sess = get_or_create_session(message.chat.id, message.bot)  # type: ignore[arg-type]
     bot = message.bot
     assert bot is not None
-    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    reply = await sess.query("/compact")
+    reply = await _run_query_with_status(bot, message.chat.id, sess, "/compact")
     await _send_reply(bot, message.chat.id, reply)
 
 
@@ -766,8 +867,7 @@ async def cb_menu(callback: CallbackQuery) -> None:
     assert bot is not None
     chat_id = callback.message.chat.id
     sess = get_or_create_session(chat_id, bot)
-    await bot.send_chat_action(chat_id, ChatAction.TYPING)
-    reply = await sess.query(prompt)
+    reply = await _run_query_with_status(bot, chat_id, sess, prompt)
     await _send_reply(bot, chat_id, reply)
 
 
@@ -803,10 +903,9 @@ async def on_text(message: Message) -> None:
     assert bot is not None
     sess = get_or_create_session(message.chat.id, bot)
 
-    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     log.info("query_start", chat_id=message.chat.id, len=len(message.text))
 
-    reply = await sess.query(message.text)
+    reply = await _run_query_with_status(bot, message.chat.id, sess, message.text)
 
     await _send_reply(bot, message.chat.id, reply)
     log.info(
@@ -866,9 +965,8 @@ async def on_photo(message: Message) -> None:
         f"Прочитай её через Read tool, чтобы увидеть содержимое."
     )
 
-    await bot.send_chat_action(chat_id, ChatAction.TYPING)
     log.info("photo_received", chat_id=chat_id, path=str(path), has_caption=bool(caption))
-    reply = await sess.query(prompt)
+    reply = await _run_query_with_status(bot, chat_id, sess, prompt)
     await _send_reply(bot, chat_id, reply)
 
 
@@ -969,7 +1067,7 @@ async def on_voice(message: Message) -> None:
     )
 
     sess = get_or_create_session(chat_id, bot)
-    reply = await sess.query(text)
+    reply = await _run_query_with_status(bot, chat_id, sess, text)
     await _send_reply(bot, chat_id, reply)
 
 
@@ -1017,7 +1115,10 @@ async def _send_reply(bot: Bot, chat_id: int, reply: StreamedReply) -> None:
         )
         return
 
-    body = reply.text.strip()
+    # Claude emits CommonMark (``**bold**``, fenced code, headings, links).
+    # Telegram's HTML mode doesn't render ``**bold**`` — convert before
+    # sending so the user sees actual formatting instead of asterisks.
+    body = md_to_html(reply.text.strip())
     if reply.tool_calls:
         # Brief activity log above the answer body.
         head = "\n".join(reply.tool_calls[-12:])  # last 12 are enough

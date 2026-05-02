@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -202,8 +203,18 @@ class ChatSession:
         the current tool use before bailing."""
         self._cancel_event.set()
 
-    async def query(self, user_text: str) -> StreamedReply:
-        """Send a message; return when Claude finishes the turn."""
+    async def query(
+        self,
+        user_text: str,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> StreamedReply:
+        """Send a message; return when Claude finishes the turn.
+
+        ``on_progress`` (optional) is awaited with a short label string
+        each time Claude starts a new tool call. The bot uses it to
+        update a heartbeat status message so the user can see we're
+        still working on long turns.
+        """
         async with self._lock:
             self._cancel_event.clear()
             try:
@@ -214,7 +225,7 @@ class ChatSession:
                 await self._ensure_client()
                 assert self._client is not None
                 await self._client.query(user_text)
-                reply = await self._collect_reply()
+                reply = await self._collect_reply(on_progress=on_progress)
                 if pull_note:
                     reply.pre_note = pull_note
                 return reply
@@ -335,7 +346,10 @@ class ChatSession:
                 await self._client.disconnect()
         self._client = None
 
-    async def _collect_reply(self) -> StreamedReply:
+    async def _collect_reply(
+        self,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> StreamedReply:
         """Drain the SDK's message stream until ResultMessage."""
         assert self._client is not None
         out = StreamedReply()
@@ -363,7 +377,12 @@ class ChatSession:
                         if self.state.thinking_visible:
                             thinking_chunks.append(block.thinking)
                     elif isinstance(block, ToolUseBlock):
-                        out.tool_calls.append(_format_tool_call(block))
+                        label = _format_tool_call(block)
+                        out.tool_calls.append(label)
+                        if on_progress is not None:
+                            # Fire-and-forget: never let TG hiccups stall
+                            # the SDK stream.
+                            asyncio.create_task(_safe_progress(on_progress, label))
             elif isinstance(msg, UserMessage):
                 # Tool results come back as UserMessage(content=[ToolResultBlock])
                 # — already echoed by Claude in its next AssistantMessage.
@@ -388,6 +407,22 @@ class ChatSession:
         out.text = "\n\n".join(t for t in text_chunks if t).strip()
         out.thinking = "\n\n".join(t for t in thinking_chunks if t).strip()
         return out
+
+
+async def _safe_progress(
+    cb: Callable[[str], Awaitable[None]],
+    label: str,
+) -> None:
+    """Run ``on_progress`` swallowing any error.
+
+    The callback is user-supplied and may hit Telegram's API which can
+    rate-limit or transiently fail. We never want such a failure to
+    propagate into the SDK stream loop — heartbeats are advisory.
+    """
+    try:
+        await cb(label)
+    except Exception as e:  # noqa: BLE001
+        log.debug("on_progress_failed", error=str(e))
 
 
 def _format_tool_call(block: ToolUseBlock) -> str:
