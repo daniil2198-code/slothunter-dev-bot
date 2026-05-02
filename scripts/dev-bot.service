@@ -3,6 +3,16 @@ Description=Slot Hunter dev-bot — Telegram → Claude Code bridge
 Documentation=https://github.com/daniil2198-code/slothunter-dev-bot
 After=network-online.target
 Wants=network-online.target
+# When ALL retries are exhausted (StartLimitBurst hit), fire a one-shot
+# notification unit so the user learns about the outage immediately
+# rather than via "ты жив?" 50 minutes later.
+OnFailure=dev-bot-crash-notify.service
+
+# StartLimitBurst caps the systemd auto-restart loop. After 5 failures
+# in 300 seconds the unit goes inactive and StAYs that way — no more
+# CPU-burning restart spam, watchdog cron will pick it up and alert.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -15,9 +25,6 @@ EnvironmentFile=/opt/slothunter-dev-bot/.env
 ExecStart=/root/.local/bin/uv run python -m app.main
 Restart=on-failure
 RestartSec=5s
-# Don't restart aggressively on permanent failures (bad token, login expired).
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 # Logs → journald, structured JSON. View with `journalctl -u dev-bot -f`.
 StandardOutput=journal

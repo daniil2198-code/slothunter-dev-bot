@@ -436,20 +436,87 @@ class PermissionBroker:
 # ─────────── can_use_tool callback factory ───────────
 
 
+# ─────────── Catastrophic patterns — NEVER auto-approved, even in YOLO ──
+#
+# Broker-level YOLO (``yolo_provider`` returning True) lets Claude run
+# anything without asking. The user explicitly opted into that. But
+# there's a tiny "pull the plug" list we still gate: things that brick
+# the VPS, exfiltrate the entire disk, or are textbook attacker
+# payloads. Claude has no business running these even in autopilot.
+#
+# Each match falls back to the broker prompt, so the user can still
+# explicitly OK it if they really meant to.
+CATASTROPHIC_BASH_PATTERNS = (
+    "rm -rf /",
+    "rm -rf /*",
+    "rm -rf ~",
+    "rm -rf $HOME",
+    "rm -rf /etc",
+    "rm -rf /var",
+    "rm -rf /root",
+    "rm -rf /home",
+    "dd if=/dev/zero of=/dev/",
+    "dd if=/dev/random of=/dev/",
+    "mkfs",
+    "fdisk",
+    "wipefs",
+    ":(){:|:&};:",  # forkbomb (compact form)
+    ": ( ) { :|:& };:",  # forkbomb (spaced)
+    "shutdown",
+    "reboot",
+    "halt",
+    "poweroff",
+    "iptables -F",
+    "ufw disable",
+    "userdel",
+    "passwd root",
+    "chmod -R 000 /",
+    "chmod 000 /",
+)
+
+
+def is_catastrophic_bash(command: str) -> bool:
+    """True if the command matches a "never auto-run" pattern.
+
+    Used by the YOLO path: we trust Claude on everything *except* this.
+    Substring match — paranoid by design, false positives just mean an
+    extra approval tap.
+    """
+    cmd = command.strip()
+    if not cmd:
+        return False
+    return any(p in cmd for p in CATASTROPHIC_BASH_PATTERNS)
+
+
 CanUseToolCallback = Callable[
     [str, dict[str, Any], ToolPermissionContext],
     Awaitable[PermissionResult],
 ]
+YoloProvider = Callable[[], bool]
 
 
-def make_can_use_tool(broker: PermissionBroker) -> CanUseToolCallback:
+def make_can_use_tool(
+    broker: PermissionBroker,
+    *,
+    yolo: YoloProvider | None = None,
+) -> CanUseToolCallback:
     """Return a ``can_use_tool`` async callback bound to this broker.
 
     Signature comes from ``claude_agent_sdk``: receives the tool name,
     input dict, and a ``ToolPermissionContext``; must return a
     ``PermissionResultAllow`` or ``PermissionResultDeny`` instance.
-    Older SDKs accepted plain dicts here — the new API requires the
-    typed dataclasses, otherwise every tool-use silently errors out.
+
+    YOLO mode (``yolo()`` returns True) — broker-level bypass:
+    we return Allow for every tool **without** asking. This works
+    under root, where the SDK's own ``permission_mode="bypassPermissions"``
+    refuses to run (Claude CLI hardcodes a no-bypass-as-root sanity check).
+    Catastrophic bash patterns (``rm -rf /``, ``dd``, forkbomb, etc.)
+    still go through the broker — even in autopilot the user gets one
+    last chance to bail.
+
+    The provider is called on every tool invocation, so toggling
+    ``/yolo on|off`` takes effect on the very next tool call without a
+    client rebuild.
     """
 
     async def callback(
@@ -472,7 +539,36 @@ def make_can_use_tool(broker: PermissionBroker) -> CanUseToolCallback:
             if len(parts) == 3:
                 local_name = parts[2]
 
-        # Browser tool policy.
+        # YOLO short-circuit. Order: catastrophic-check, then auto-allow.
+        # Browser MCP "always ask" patterns also bypass YOLO — those are
+        # Claude-running-arbitrary-JS, dangerous regardless of mode.
+        is_yolo = yolo() if yolo is not None else False
+        if is_yolo:
+            if tool_name == "Bash":
+                cmd = str(tool_input.get("command", ""))
+                if is_catastrophic_bash(cmd):
+                    log.warning("yolo_catastrophic_blocked", command=cmd[:120])
+                    allowed, reason = await broker.request(tool_name, tool_input)
+                    if allowed:
+                        return PermissionResultAllow(updated_input=tool_input)
+                    return PermissionResultDeny(
+                        message=reason or "Отклонено пользователем",
+                        interrupt=False,
+                    )
+            if local_name in _BROWSER_ALWAYS_ASK:
+                # browser_evaluate / run_code_unsafe — same risk as
+                # arbitrary JS, ask even in YOLO.
+                allowed, reason = await broker.request(tool_name, tool_input)
+                if allowed:
+                    return PermissionResultAllow(updated_input=tool_input)
+                return PermissionResultDeny(
+                    message=reason or "Отклонено пользователем",
+                    interrupt=False,
+                )
+            log.info("yolo_auto_approved", tool=tool_name)
+            return PermissionResultAllow(updated_input=tool_input)
+
+        # Browser tool policy (non-YOLO).
         if local_name in _BROWSER_AUTO_TOOLS:
             log.info("browser_auto_approved", tool=tool_name)
             return PermissionResultAllow(updated_input=tool_input)

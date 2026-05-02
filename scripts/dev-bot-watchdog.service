@@ -1,0 +1,10 @@
+[Unit]
+Description=Probe dev-bot health and notify on failure
+Documentation=https://github.com/daniil2198-code/slothunter-dev-bot
+
+[Service]
+Type=oneshot
+ExecStart=/opt/slothunter-dev-bot/scripts/dev-bot-watchdog.sh
+# Watchdog should never bring down the machine — even if it errors,
+# treat as success so the timer keeps running.
+SuccessExitStatus=0 1

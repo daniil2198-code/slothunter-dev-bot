@@ -1,0 +1,13 @@
+[Unit]
+Description=Slot Hunter dev-bot crash notifier — fires once when dev-bot fails
+
+# This unit is invoked via ``OnFailure=`` from dev-bot.service. It
+# runs the watchdog one-shot, which sends a Telegram alert through
+# the slot-hunter bot (different token, so the channel works even
+# when dev-bot itself is down).
+
+[Service]
+Type=oneshot
+ExecStart=/opt/slothunter-dev-bot/scripts/dev-bot-watchdog.sh
+# Don't fail loudly if the watchdog can't notify (no env, no network).
+SuccessExitStatus=0 1

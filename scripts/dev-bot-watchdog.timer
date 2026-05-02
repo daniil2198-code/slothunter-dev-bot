@@ -1,0 +1,17 @@
+[Unit]
+Description=Periodic dev-bot health probe (5-min cadence)
+Documentation=https://github.com/daniil2198-code/slothunter-dev-bot
+
+# Why a separate periodic timer when we already have OnFailure=?
+# OnFailure only fires when systemd transitions the unit to "failed".
+# It misses the case where StartLimitBurst is exhausted and the unit
+# stays inactive for hours. Periodic probe closes that gap.
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=dev-bot-watchdog.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

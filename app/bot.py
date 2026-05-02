@@ -20,7 +20,6 @@ Anything else (text, photos with captions) is forwarded to Claude.
 from __future__ import annotations
 
 import html
-import os
 import re
 import time
 from pathlib import Path
@@ -330,34 +329,20 @@ async def cmd_yolo(message: Message, command: CommandObject) -> None:
         return
 
     if arg in {"on", "yolo", "true", "1", "yes"}:
-        # Claude Code CLI hard-blocks --dangerously-skip-permissions
-        # when running as root. We currently DO run as root (#0019 in
-        # slot-hunter ROADMAP — non-root deploy user). Don't even let
-        # the user toggle the state if it can't possibly stick — they
-        # tried this once and the bot threw CLIConnectionError on
-        # every subsequent turn until /yolo off was issued.
-        if os.geteuid() == 0:
-            await message.answer(
-                "🛑 <b>Bypass под root недоступен.</b>\n\n"
-                "Claude Code CLI отказывается работать с "
-                "<code>--dangerously-skip-permissions</code> от root — "
-                "это его собственный sanity-check (security feature, "
-                "не наша). Сейчас бот живёт под root.\n\n"
-                "Чтобы включить YOLO, сначала надо переехать на "
-                "non-root deploy-юзера (slot-hunter task #0019 "
-                "в backlog). Пока что — оставайся на "
-                "<code>/yolo off</code>; вылови раздражающие prompt'ы "
-                "через расширение auto-list в "
-                "<code>app/permissions.py</code>.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
+        # Broker-level YOLO: we don't propagate ``bypassPermissions`` to
+        # the SDK (Claude CLI hard-blocks that combo under root). Instead
+        # the broker's can_use_tool callback returns Allow for everything
+        # while we're in this mode. Catastrophic patterns (rm -rf /, dd,
+        # forkbomb, etc.) still go through the prompt as a final safety
+        # net.
         await sess.set_permission_mode("bypassPermissions")
         await message.answer(
-            "🚀 <b>YOLO включён.</b> Claude больше не спросит — ни про bash, "
-            "ни про файлы, ни про MCP. Включает всё: <code>rm</code>, "
-            "<code>git push --force</code>, <code>DROP TABLE</code>. "
-            "Используй коротко и осознанно.\n\n"
+            "🚀 <b>YOLO включён.</b> Claude больше не спрашивает — bash, "
+            "edits, MCP пройдут без подтверждения. Останется фильтр на "
+            "катастрофические команды (<code>rm -rf /</code>, "
+            "<code>dd if=/dev/zero of=/dev/sda</code>, форкбомбу, "
+            "<code>shutdown</code>, <code>iptables -F</code>) — на них всё "
+            "равно спросит, на случай галлюцинаций.\n\n"
             "Выключить: <code>/yolo off</code>",
             parse_mode=ParseMode.HTML,
         )

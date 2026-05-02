@@ -41,14 +41,30 @@ log "[3/4] ensuring state dir /var/lib/slothunter-dev-bot..."
 mkdir -p /var/lib/slothunter-dev-bot
 chmod 700 /var/lib/slothunter-dev-bot
 
-# ─────────── 5. Install/refresh systemd unit ───────────
-UNIT_SRC="$APP_DIR/scripts/dev-bot.service"
-UNIT_DST="/etc/systemd/system/${SERVICE}.service"
-if ! cmp -s "$UNIT_SRC" "$UNIT_DST"; then
-  log "[4/4] installing systemd unit..."
-  cp "$UNIT_SRC" "$UNIT_DST"
+# ─────────── 5. Install/refresh systemd units ───────────
+# Four units total now:
+#   - dev-bot.service             — the bot itself
+#   - dev-bot-crash-notify.service — fires via OnFailure= for instant alert
+#   - dev-bot-watchdog.service     — periodic health probe (oneshot)
+#   - dev-bot-watchdog.timer       — schedules the watchdog every 5 min
+units_changed=0
+for unit in dev-bot.service dev-bot-crash-notify.service \
+            dev-bot-watchdog.service dev-bot-watchdog.timer; do
+  src="$APP_DIR/scripts/$unit"
+  dst="/etc/systemd/system/$unit"
+  [ -f "$src" ] || continue
+  if ! cmp -s "$src" "$dst"; then
+    cp "$src" "$dst"
+    units_changed=1
+    log "  installed $unit"
+  fi
+done
+if [ "$units_changed" = "1" ]; then
+  log "[4/4] systemd units changed — daemon-reload"
   systemctl daemon-reload
 fi
+# Watchdog timer is on by default — enable + start idempotently.
+systemctl enable --now dev-bot-watchdog.timer >/dev/null 2>&1 || true
 
 # ─────────── 6. Pre-flight: claude /login ───────────
 # The bot can't run unless the local claude CLI is authed against
