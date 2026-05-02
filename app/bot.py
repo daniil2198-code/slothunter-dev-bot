@@ -549,6 +549,43 @@ async def cmd_resume(message: Message, command: CommandObject) -> None:
     )
 
 
+def _list_e2e_scenarios() -> tuple[Path, list[str]]:
+    """Return ``(scenarios_dir, names)``. ``names`` empty if dir missing."""
+    scenarios_dir = settings.default_workdir / "notes" / "e2e"
+    if not scenarios_dir.is_dir():
+        return scenarios_dir, []
+    names = sorted(
+        p.stem for p in scenarios_dir.glob("*.md") if p.stem != "README"
+    )
+    return scenarios_dir, names
+
+
+def build_e2e_prompt(name: str) -> tuple[str | None, str | None]:
+    """Build the Claude prompt for running an e2e scenario.
+
+    Returns ``(prompt, None)`` on success or ``(None, error_message)``
+    when the scenario file isn't there. Used both by the ``/test``
+    Telegram command and the file-trigger queue (``triggers.py``) —
+    the trigger queue can't go through Aiogram's command dispatcher
+    because the inbound text is a write-from-disk, not a TG ``Message``.
+    """
+    scenarios_dir, _ = _list_e2e_scenarios()
+    target = scenarios_dir / f"{name}.md"
+    if not target.is_file():
+        return None, f"Сценарий «{name}» не найден ({target})"
+
+    prompt = (
+        f"Прогон e2e-сценария.\n\n"
+        f"1. Прочитай файл: {target}\n"
+        f"2. Выполни его шаги через Playwright MCP.\n"
+        f"3. По итогу дай вердикт: **PASS** или **FAIL** одной строкой "
+        f"вверху ответа, потом краткие наблюдения и ссылки на скриншоты.\n\n"
+        f"Если что-то пошло не по плану и ты не уверен в трактовке — "
+        f"всё равно вынеси PASS/FAIL и объясни сомнения."
+    )
+    return prompt, None
+
+
 @router.message(Command("test"))
 async def cmd_test(message: Message, command: CommandObject) -> None:
     """Run an E2E scenario from ``notes/e2e/`` against the prod Mini App.
@@ -565,17 +602,13 @@ async def cmd_test(message: Message, command: CommandObject) -> None:
     assert bot is not None
     chat_id = message.chat.id
 
-    # Scenarios live in the slot-hunter project, not in dev-bot. Use
-    # the configured workdir (which IS slot-hunter).
-    scenarios_dir = settings.default_workdir / "notes" / "e2e"
+    scenarios_dir, scenarios = _list_e2e_scenarios()
     if not scenarios_dir.is_dir():
         await message.answer(
             f"❌ Не нашёл сценариев: <code>{html.escape(str(scenarios_dir))}</code>",
             parse_mode=ParseMode.HTML,
         )
         return
-
-    scenarios = sorted(p.stem for p in scenarios_dir.glob("*.md") if p.stem != "README")
 
     if not command.args:
         if not scenarios:
@@ -590,8 +623,8 @@ async def cmd_test(message: Message, command: CommandObject) -> None:
         return
 
     name = command.args.strip().split()[0]
-    target = scenarios_dir / f"{name}.md"
-    if not target.is_file():
+    prompt, err = build_e2e_prompt(name)
+    if err is not None or prompt is None:
         await message.answer(
             f"❌ Сценарий <code>{html.escape(name)}</code> не найден. "
             "Список — <code>/test</code>.",
@@ -599,18 +632,6 @@ async def cmd_test(message: Message, command: CommandObject) -> None:
         )
         return
 
-    # Build the prompt for Claude. Explicit and short — Claude already
-    # knows about Playwright via the system prompt, the scenario file
-    # itself describes what to do.
-    prompt = (
-        f"Прогон e2e-сценария.\n\n"
-        f"1. Прочитай файл: {target}\n"
-        f"2. Выполни его шаги через Playwright MCP.\n"
-        f"3. По итогу дай вердикт: **PASS** или **FAIL** одной строкой "
-        f"вверху ответа, потом краткие наблюдения и ссылки на скриншоты.\n\n"
-        f"Если что-то пошло не по плану и ты не уверен в трактовке — "
-        f"всё равно вынеси PASS/FAIL и объясни сомнения."
-    )
     sess = get_or_create_session(chat_id, bot)
     await bot.send_chat_action(chat_id, ChatAction.TYPING)
     log.info("e2e_test_start", chat_id=chat_id, scenario=name)

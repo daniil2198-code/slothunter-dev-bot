@@ -27,7 +27,7 @@ import contextlib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from app.bot import _send_reply, get_or_create_session
+from app.bot import _send_reply, build_e2e_prompt, get_or_create_session
 from app.config import settings
 from app.logging import get_logger
 
@@ -100,7 +100,14 @@ async def process_pending_triggers(bot: Bot) -> None:
                 parse_mode="HTML",
             )
             sess = get_or_create_session(chat_id, bot)
-            reply = await sess.query(text)
+            # If the trigger is a slash-command we know how to handle
+            # natively (e.g. ``/test mini-app-home-loads``), translate
+            # it to the same prompt our Aiogram handler would build.
+            # Plain ``sess.query("/test foo")`` would otherwise reach
+            # Claude Code as a builtin slash-command attempt and fail
+            # with "Unknown command: /test".
+            prompt = _translate_slash_command(first_line) or text
+            reply = await sess.query(prompt)
             await _send_reply(bot, chat_id, reply)
         except Exception as e:  # noqa: BLE001 — never crash the scheduler
             log.exception("trigger_failed", path=str(path), error=str(e))
@@ -115,6 +122,38 @@ async def process_pending_triggers(bot: Bot) -> None:
             continue
 
         _mark_done(path)
+
+
+def _translate_slash_command(line: str) -> str | None:
+    """Map a leading slash-command in a trigger to a Claude prompt.
+
+    Triggers are dropped as plain text by other processes (deploy.sh
+    writes ``/test mini-app-home-loads``). When the file content
+    starts with a slash-command we recognize, we want to invoke the
+    same logic the Aiogram handler would — but those handlers expect
+    a ``Message`` object we don't have here. So we re-derive the
+    prompt directly via shared helpers in ``app.bot``.
+
+    Returns the translated prompt, or ``None`` if the line is just
+    plain text (in which case the caller forwards it as-is to Claude).
+    """
+    line = line.strip()
+    if not line.startswith("/"):
+        return None
+
+    # ``/test <scenario>`` — re-use the e2e prompt builder.
+    if line.startswith("/test "):
+        name = line.split(maxsplit=1)[1].strip().split()[0]
+        prompt, err = build_e2e_prompt(name)
+        if prompt is not None:
+            return prompt
+        log.warning("trigger_test_unknown_scenario", name=name, error=err)
+        return f"Не нашёл e2e-сценария «{name}». Скажи это в TG чтобы юзер увидел."
+
+    # Unknown slash-command — fall back to plain text. Claude will
+    # likely complain about it but at least we logged the case.
+    log.warning("trigger_unknown_slash", line=line[:80])
+    return None
 
 
 def _mark_done(path: Path) -> None:
