@@ -20,6 +20,7 @@ Anything else (text, photos with captions) is forwarded to Claude.
 from __future__ import annotations
 
 import html
+import os
 import re
 import time
 from pathlib import Path
@@ -329,6 +330,28 @@ async def cmd_yolo(message: Message, command: CommandObject) -> None:
         return
 
     if arg in {"on", "yolo", "true", "1", "yes"}:
+        # Claude Code CLI hard-blocks --dangerously-skip-permissions
+        # when running as root. We currently DO run as root (#0019 in
+        # slot-hunter ROADMAP — non-root deploy user). Don't even let
+        # the user toggle the state if it can't possibly stick — they
+        # tried this once and the bot threw CLIConnectionError on
+        # every subsequent turn until /yolo off was issued.
+        if os.geteuid() == 0:
+            await message.answer(
+                "🛑 <b>Bypass под root недоступен.</b>\n\n"
+                "Claude Code CLI отказывается работать с "
+                "<code>--dangerously-skip-permissions</code> от root — "
+                "это его собственный sanity-check (security feature, "
+                "не наша). Сейчас бот живёт под root.\n\n"
+                "Чтобы включить YOLO, сначала надо переехать на "
+                "non-root deploy-юзера (slot-hunter task #0019 "
+                "в backlog). Пока что — оставайся на "
+                "<code>/yolo off</code>; вылови раздражающие prompt'ы "
+                "через расширение auto-list в "
+                "<code>app/permissions.py</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
         await sess.set_permission_mode("bypassPermissions")
         await message.answer(
             "🚀 <b>YOLO включён.</b> Claude больше не спросит — ни про bash, "
