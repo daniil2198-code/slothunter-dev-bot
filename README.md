@@ -11,8 +11,16 @@ Telegram-бот, через который ты разрабатываешь Slo
 - ✅ Подписка Claude.ai (НЕ API-ключ — авторизация через `claude /login`)
 - ✅ Stateful сессия с автоматическим resume через рестарты
 - ✅ Inline-кнопки разрешения для опасных операций
-- ✅ Smart Bash auto-approve для read-only команд (git status / log /
-  diff, ls, cat, pytest, ruff, uv, …)
+- ✅ Smart Bash auto-approve для read-only команд + `cp/mv/tar/make/
+  git commit/systemctl restart/uv sync/docker logs` без подтверждений
+- ✅ **`/yolo on|off`** — broker-level bypass: Claude перестаёт
+  спрашивать. Работает **под root** (обходит SDK anti-root check
+  через broker, не через SDK `bypassPermissions`).
+- ✅ **Catastrophic safety net** — даже в YOLO остаются за approval:
+  `rm -rf /`, `dd if=/dev/zero of=/dev/`, `mkfs`, форкбомба,
+  `shutdown`, `iptables -F`, `userdel`, `passwd root` и т.п.
+- ✅ **`/thinking on|off`** — surface ThinkingBlocks отдельным
+  `💭`-сообщением (отладка / любопытство).
 - ✅ Auto-pull cwd перед каждой задачей
 - ✅ `/menu` — quick-action клавиатура (Status / Diff / Tests / Deploy /
   Roadmap / Logs)
@@ -34,6 +42,9 @@ Telegram-бот, через который ты разрабатываешь Slo
   запуск через `/test <name>`.
 - ✅ **Auto-test после деплоя** — slot-hunter `deploy.sh` дропает
   trigger-файл, бот в течение ~60с прогоняет smoke-тест.
+- ✅ **Watchdog** — `OnFailure=` instant alert + `*-watchdog.timer`
+  (5-мин probe) → TG-уведомление через slot-hunter bot (другой
+  токен — канал работает даже если dev-bot мёртв).
 
 ## Один раз: подготовка VPS
 
@@ -149,6 +160,8 @@ bash scripts/deploy.sh
 | `/resume <id>` | стартовать с этим контекстом как фон |
 | `/test` | список e2e-сценариев |
 | `/test <name>` | прогон конкретного через Playwright |
+| `/yolo on\|off` | bypass approval-prompts (catastrophic patterns остаются) |
+| `/thinking on\|off` | показывать рассуждения Claude отдельным сообщением |
 
 ## Permission model
 

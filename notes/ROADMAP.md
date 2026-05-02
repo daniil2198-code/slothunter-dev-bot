@@ -22,6 +22,12 @@
 - ✅ **M3.2** — dev-token bypass для Mini App (см. slot-hunter `app/api/deps.py`), Claude видит реальные данные
 - ✅ **M3.3** — e2e-сценарии в `slot-hunter/notes/e2e/` (home, paywall, api-health)
 - ✅ **M3.4** — `/test [<scenario>]` команда + file-based триггер для авто-теста после деплоя
+- ✅ **VPS push keys** (2026-05-02) — два per-repo Ed25519 + SSH-config (см. `notes/decisions.md`)
+- ✅ **Расширенный auto-list** — `cp/mv/tar/make/git commit/systemctl restart/uv sync` без prompt'ов
+- ✅ **`/yolo on|off`** — broker-level bypass работает под root (без SDK `bypassPermissions`)
+- ✅ **`/thinking on|off`** — surface ThinkingBlocks отдельным `💭` сообщением
+- ✅ **Catastrophic safety net** — `rm -rf /`, `dd`, форкбомба, `shutdown` и т.п. остаются за approval даже в YOLO
+- ✅ **Watchdog** — `OnFailure=` + `dev-bot-watchdog.timer` (5-мин cadence) с recovery-уведомлением через slot-hunter bot
 
 ## 🔥 Planned next
 
