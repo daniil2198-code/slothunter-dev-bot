@@ -47,6 +47,15 @@ log = get_logger(__name__)
 # ─────────── Persistent state ───────────
 
 
+# Valid values for ``permission_mode`` per Claude Agent SDK. ``default``
+# routes every non-pre-allowed tool call through ``can_use_tool``
+# (TG inline button); ``bypassPermissions`` skips the broker entirely
+# (YOLO). ``acceptEdits`` would auto-approve Edit/Write but still ask
+# for Bash — currently we don't expose it via /yolo to keep the toggle
+# binary, but the SDK supports it if a future command needs it.
+VALID_PERMISSION_MODES = ("default", "bypassPermissions", "acceptEdits", "plan")
+
+
 @dataclass
 class ChatState:
     """What we remember about a chat across restarts."""
@@ -54,6 +63,14 @@ class ChatState:
     chat_id: int
     session_id: str | None = None
     cwd: Path = field(default_factory=lambda: settings.default_workdir)
+    # Per-chat toggle. Persisted so a /yolo on survives bot restarts —
+    # otherwise every reboot would silently revert to the safe default
+    # and the user's "разреши всё пока" intent gets lost.
+    permission_mode: str = "default"
+    # When true, ThinkingBlocks from the SDK stream get surfaced in TG
+    # as a separate "💭" message (truncated to keep the chat readable).
+    # Off by default — most turns it's noise.
+    thinking_visible: bool = False
 
     @classmethod
     def load(cls, chat_id: int) -> ChatState:
@@ -65,10 +82,16 @@ class ChatState:
         except (OSError, json.JSONDecodeError) as e:
             log.warning("state_load_failed", chat_id=chat_id, error=str(e))
             return cls(chat_id=chat_id)
+        mode = data.get("permission_mode") or "default"
+        if mode not in VALID_PERMISSION_MODES:
+            log.warning("bad_permission_mode_in_state", mode=mode, fallback="default")
+            mode = "default"
         return cls(
             chat_id=chat_id,
             session_id=data.get("session_id"),
             cwd=Path(data.get("cwd") or settings.default_workdir),
+            permission_mode=mode,
+            thinking_visible=bool(data.get("thinking_visible") or False),
         )
 
     def save(self) -> None:
@@ -77,7 +100,12 @@ class ChatState:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(
             json.dumps(
-                {"session_id": self.session_id, "cwd": str(self.cwd)},
+                {
+                    "session_id": self.session_id,
+                    "cwd": str(self.cwd),
+                    "permission_mode": self.permission_mode,
+                    "thinking_visible": self.thinking_visible,
+                },
                 ensure_ascii=False,
             ),
             encoding="utf-8",
@@ -108,6 +136,10 @@ class StreamedReply:
     # Optional pre-message (rendered above the answer) — currently only
     # used by the auto-pull feature to surface "git pull: a1b → c2d".
     pre_note: str | None = None
+    # Concatenated thinking text. Empty unless ``thinking_visible`` is
+    # on for the chat — we still drop ThinkingBlocks otherwise to keep
+    # the bot reply latency-free.
+    thinking: str = ""
 
 
 class ChatSession:
@@ -194,6 +226,37 @@ class ChatSession:
         async with self._lock:
             await self._close_client()
 
+    async def set_permission_mode(self, mode: str) -> None:
+        """Switch between safe ``default`` and YOLO ``bypassPermissions``.
+
+        Persists to disk and force-recreates the SDK client so the next
+        query() opens with the new mode. Validates against the SDK's
+        accepted values — silently no-ops on unknown input.
+        """
+        if mode not in VALID_PERMISSION_MODES:
+            log.warning("set_permission_mode_rejected", mode=mode)
+            return
+        async with self._lock:
+            self.state.permission_mode = mode
+            self.state.save()
+            # Drop the client so _ensure_client() rebuilds it with the
+            # new mode. Resume token is kept — SDK should still load
+            # the previous turn's history.
+            await self._close_client()
+        log.info("permission_mode_changed", chat_id=self.chat_id, mode=mode)
+
+    async def set_thinking_visible(self, value: bool) -> None:
+        """Toggle whether ThinkingBlocks reach TG. No client rebuild —
+        the flag is read at message-collect time, not at SDK init."""
+        async with self._lock:
+            self.state.thinking_visible = bool(value)
+            self.state.save()
+        log.info(
+            "thinking_visible_changed",
+            chat_id=self.chat_id,
+            value=self.state.thinking_visible,
+        )
+
     async def seed_with_summary(self, summary: str) -> None:
         """Start a fresh session pre-loaded with a previous-session
         summary so Claude has the context.
@@ -229,7 +292,12 @@ class ChatSession:
         opts: dict[str, object] = {
             "cwd": str(self.state.cwd),
             "allowed_tools": sorted(AUTO_TOOLS),
-            "permission_mode": "default",  # ask for everything not in allowed_tools
+            # ``default`` routes every non-pre-allowed tool through the
+            # TG broker. ``bypassPermissions`` (toggled via /yolo on)
+            # tells the SDK to skip the callback entirely — Claude can
+            # then run any tool without asking. The user opts in
+            # explicitly knowing the trade-off.
+            "permission_mode": self.state.permission_mode,
             "can_use_tool": make_can_use_tool(self.broker),
             "resume": self.state.session_id,  # None on first run; SDK ignores
             "system_prompt": _system_prompt(),
@@ -267,6 +335,7 @@ class ChatSession:
         assert self._client is not None
         out = StreamedReply()
         text_chunks: list[str] = []
+        thinking_chunks: list[str] = []
 
         async for msg in self._client.receive_response():
             if self._cancel_event.is_set():
@@ -282,8 +351,12 @@ class ChatSession:
                     if isinstance(block, TextBlock):
                         text_chunks.append(block.text)
                     elif isinstance(block, ThinkingBlock):
-                        # Don't surface thinking in TG — too noisy.
-                        pass
+                        # Forward only when the chat opted in (/thinking
+                        # on). Otherwise we drop it — the streaming SDK
+                        # decodes the full block whether we keep it or
+                        # not, so this is purely a presentation toggle.
+                        if self.state.thinking_visible:
+                            thinking_chunks.append(block.thinking)
                     elif isinstance(block, ToolUseBlock):
                         out.tool_calls.append(_format_tool_call(block))
             elif isinstance(msg, UserMessage):
@@ -308,6 +381,7 @@ class ChatSession:
                 break
 
         out.text = "\n\n".join(t for t in text_chunks if t).strip()
+        out.thinking = "\n\n".join(t for t in thinking_chunks if t).strip()
         return out
 
 

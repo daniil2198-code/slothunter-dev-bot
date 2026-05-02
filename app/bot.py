@@ -144,11 +144,17 @@ _HELP_INPUTS = (
 _HELP_COMMANDS = (
     "⚙️ <b>Команды</b>\n\n"
     "<b>Контекст разговора</b>\n"
-    "<code>/status</code>  — папка, session id, модель, betas\n"
+    "<code>/status</code>  — папка, session id, модель, betas, "
+    "режим разрешений, thinking-вкл/выкл\n"
     "<code>/reset</code>   — забыть разговор; перед стиранием сохранит summary\n"
     "<code>/compact</code> — ужать историю в summary; контекст продолжается\n"
     "<code>/cancel</code>  — прервать текущий ход (best-effort)\n"
     "<code>/cd &lt;path&gt;</code> — сменить рабочую директорию Claude\n\n"
+    "<b>Поведение</b>\n"
+    "<code>/yolo on|off</code> — включить bypass-режим (Claude перестаёт "
+    "спрашивать на bash / edits / MCP). Без аргумента — статус.\n"
+    "<code>/thinking on|off</code> — показывать рассуждения Claude "
+    "отдельным «💭»-сообщением. Без аргумента — статус.\n\n"
     "<b>Журнал разговоров</b>\n"
     "<code>/history</code> — список сохранённых сессий (id, время, заголовок)\n"
     "<code>/show &lt;id&gt;</code> — открыть сохранённый summary\n"
@@ -268,14 +274,123 @@ async def cmd_status(message: Message) -> None:
     # can verify by asking the bot directly: "какая ты модель?".
     model = settings.model or "<i>(default — Claude Code chooses)</i>"
     betas = ", ".join(settings.betas) if settings.betas else "<i>(none)</i>"
+    perm_label = _format_permission_mode(sess.state.permission_mode)
+    thinking_label = "вкл" if sess.state.thinking_visible else "выкл"
     text = (
         f"📍 cwd: <code>{html.escape(str(sess.state.cwd))}</code>\n"
         f"🆔 session: <code>{html.escape(sid)}</code>\n"
         f"🤖 model: <code>{html.escape(model)}</code>\n"
         f"🧪 betas: <code>{betas}</code>\n"
+        f"🔐 разрешения: {perm_label}\n"
+        f"💭 thinking в чате: {thinking_label}\n"
         f"⏳ ожидание подтверждения: {pending}"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+def _format_permission_mode(mode: str) -> str:
+    """Human label for the /status / /yolo replies."""
+    return {
+        "default": "🔒 default (спрашиваю)",
+        "bypassPermissions": "🚀 bypass — YOLO (без вопросов)",
+        "acceptEdits": "✏️ acceptEdits (правки авто, bash спрашиваю)",
+        "plan": "📖 plan (read-only)",
+    }.get(mode, f"<code>{html.escape(mode)}</code>")
+
+
+# ─────────── /yolo + /thinking — runtime toggles ───────────
+#
+# These two commands let the user flip behaviour mid-session without
+# editing config / restarting the bot. State is per-chat and persists
+# across bot restarts (saved in ``state_dir/chat_<id>.json``).
+
+
+@router.message(Command("yolo"))
+async def cmd_yolo(message: Message, command: CommandObject) -> None:
+    """Toggle Claude's permission_mode between ``default`` and
+    ``bypassPermissions``. The latter skips the inline-button prompt
+    entirely — Claude can run any tool, edit any file, execute any
+    bash command. Useful when the user trusts the run and is tired
+    of tapping Allow.
+
+    Usage: ``/yolo on`` / ``/yolo off`` / ``/yolo`` (status)
+    """
+    sess = get_or_create_session(message.chat.id, message.bot)  # type: ignore[arg-type]
+    arg = (command.args or "").strip().lower()
+
+    if not arg or arg == "status":
+        await message.answer(
+            f"🔐 Сейчас: {_format_permission_mode(sess.state.permission_mode)}\n\n"
+            "Переключить:\n"
+            "<code>/yolo on</code> — без вопросов (YOLO)\n"
+            "<code>/yolo off</code> — спрашивать как обычно",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if arg in {"on", "yolo", "true", "1", "yes"}:
+        await sess.set_permission_mode("bypassPermissions")
+        await message.answer(
+            "🚀 <b>YOLO включён.</b> Claude больше не спросит — ни про bash, "
+            "ни про файлы, ни про MCP. Включает всё: <code>rm</code>, "
+            "<code>git push --force</code>, <code>DROP TABLE</code>. "
+            "Используй коротко и осознанно.\n\n"
+            "Выключить: <code>/yolo off</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    elif arg in {"off", "default", "false", "0", "no"}:
+        await sess.set_permission_mode("default")
+        await message.answer(
+            "🔒 Вернулся в обычный режим — спрашиваю на всё, что не "
+            "в auto-списке.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await message.answer(
+            "Не понял. <code>/yolo on</code>, <code>/yolo off</code>, "
+            "или <code>/yolo</code> (статус).",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+@router.message(Command("thinking"))
+async def cmd_thinking(message: Message, command: CommandObject) -> None:
+    """Toggle whether ThinkingBlocks from Claude get surfaced in TG.
+
+    Off (default) — рассуждения отбрасываются ещё до отправки в чат.
+    On — каждый ход пушит отдельным сообщением «💭 …» (truncated).
+    """
+    sess = get_or_create_session(message.chat.id, message.bot)  # type: ignore[arg-type]
+    arg = (command.args or "").strip().lower()
+
+    if not arg or arg == "status":
+        state = "вкл" if sess.state.thinking_visible else "выкл"
+        await message.answer(
+            f"💭 Thinking в чате: <b>{state}</b>\n\n"
+            "Переключить:\n"
+            "<code>/thinking on</code> — показывать рассуждения\n"
+            "<code>/thinking off</code> — прятать (default)",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if arg in {"on", "true", "1", "yes"}:
+        await sess.set_thinking_visible(True)
+        await message.answer(
+            "💭 Thinking теперь видно. Каждый ответ может прийти двумя "
+            "сообщениями: сначала рассуждения, потом сам ответ. Если "
+            "становится шумно — <code>/thinking off</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+    elif arg in {"off", "false", "0", "no"}:
+        await sess.set_thinking_visible(False)
+        await message.answer("💭 Thinking скрыт. Возвращаюсь к лаконичным ответам.")
+    else:
+        await message.answer(
+            "Не понял. <code>/thinking on</code>, <code>/thinking off</code>, "
+            "или <code>/thinking</code> (статус).",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 @router.message(Command("reset"))
@@ -847,6 +962,24 @@ async def on_unsupported_media(message: Message) -> None:
 
 async def _send_reply(bot: Bot, chat_id: int, reply: StreamedReply) -> None:
     """Render a StreamedReply into one or more TG messages."""
+    # Pre-message: thinking text (if /thinking on for this chat). Sent
+    # FIRST so the user sees Claude's reasoning above the answer in
+    # the scroll. Truncated to keep TG happy and the chat readable —
+    # the full text would often blow past the 3500-char chunk anyway.
+    if reply.thinking:
+        thinking = reply.thinking
+        max_len = 3000
+        if len(thinking) > max_len:
+            thinking = thinking[:max_len] + "\n\n…[обрезано]"
+        try:
+            await bot.send_message(
+                chat_id,
+                f"💭 <i>{html.escape(thinking)}</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:  # noqa: BLE001 — never let thinking break the answer
+            log.warning("send_thinking_failed", error=str(e))
+
     if reply.error:
         await bot.send_message(
             chat_id,
