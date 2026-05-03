@@ -1146,15 +1146,15 @@ async def _send_reply(bot: Bot, chat_id: int, reply: StreamedReply) -> None:
 
     chunks = chunk_text(body)
     for i, chunk in enumerate(chunks):
-        # First chunk gets HTML; subsequent chunks plain (could contain
-        # broken tags if we split mid-tag). Trade-off: occasional ugly
-        # chunk vs. crash on malformed HTML.
+        # Send EVERY chunk with HTML mode. Earlier we only HTML-parsed
+        # the first chunk on the theory that mid-tag splits would crash
+        # subsequent ones, but the chunker only splits on ``\n\n`` /
+        # ``\n``, which means tags are never broken in practice — and
+        # the upside is huge: long answers stop showing raw ``<b>…</b>``
+        # in chunks #2+. If TG ever does reject (malformed HTML), we
+        # catch and re-send as plain text below.
         try:
-            await bot.send_message(
-                chat_id,
-                chunk,
-                parse_mode=ParseMode.HTML if i == 0 else None,
-            )
+            await bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML)
         except Exception as e:  # noqa: BLE001
             log.warning("send_chunk_failed", error=str(e), chunk_idx=i)
             # Fall back to plain text on parse error.
