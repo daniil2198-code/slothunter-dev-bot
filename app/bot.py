@@ -40,7 +40,7 @@ from aiogram.types import (
 
 from app.auth import AllowedUserMiddleware
 from app.chunker import chunk_text, is_too_long_for_messages
-from app.claude_session import ChatSession, StreamedReply
+from app.claude_session import VALID_EFFORT_LEVELS, ChatSession, StreamedReply
 from app.config import settings
 from app.logging import get_logger
 from app.md_to_tg import to_html as md_to_html
@@ -248,7 +248,7 @@ _HELP_COMMANDS = (
     "⚙️ <b>Команды</b>\n\n"
     "<b>Контекст разговора</b>\n"
     "<code>/status</code>  — папка, session id, модель, betas, "
-    "режим разрешений, thinking-вкл/выкл\n"
+    "режим разрешений, thinking / tools вкл-выкл\n"
     "<code>/reset</code>   — забыть разговор; перед стиранием сохранит summary\n"
     "<code>/compact</code> — ужать историю в summary; контекст продолжается\n"
     "<code>/cancel</code>  — прервать текущий ход (best-effort)\n"
@@ -257,7 +257,12 @@ _HELP_COMMANDS = (
     "<code>/yolo on|off</code> — включить bypass-режим (Claude перестаёт "
     "спрашивать на bash / edits / MCP). Без аргумента — статус.\n"
     "<code>/thinking on|off</code> — показывать рассуждения Claude "
-    "отдельным «💭»-сообщением. Без аргумента — статус.\n\n"
+    "отдельным «💭»-сообщением. Без аргумента — статус.\n"
+    "<code>/tools on|off</code> — показывать над ответом список команд, "
+    "которые я запускал. По умолчанию выключено. Без аргумента — статус.\n"
+    "<code>/effort low|medium|high|xhigh|max</code> — глубина обдумывания. "
+    "Меньше = быстрее и дешевле, больше = дольше и умнее. "
+    "Без аргумента — статус.\n\n"
     "<b>Журнал разговоров</b>\n"
     "<code>/history</code> — список сохранённых сессий (id, время, заголовок)\n"
     "<code>/show &lt;id&gt;</code> — открыть сохранённый summary\n"
@@ -379,13 +384,16 @@ async def cmd_status(message: Message) -> None:
     betas = ", ".join(settings.betas) if settings.betas else "<i>(none)</i>"
     perm_label = _format_permission_mode(sess.state.permission_mode)
     thinking_label = "вкл" if sess.state.thinking_visible else "выкл"
+    tools_label = "вкл" if sess.state.tools_visible else "выкл"
     text = (
         f"📍 cwd: <code>{html.escape(str(sess.state.cwd))}</code>\n"
         f"🆔 session: <code>{html.escape(sid)}</code>\n"
         f"🤖 model: <code>{html.escape(model)}</code>\n"
         f"🧪 betas: <code>{betas}</code>\n"
         f"🔐 разрешения: {perm_label}\n"
+        f"🧠 effort: <code>{html.escape(sess.state.effort)}</code>\n"
         f"💭 thinking в чате: {thinking_label}\n"
+        f"🔧 список команд над ответом: {tools_label}\n"
         f"⏳ ожидание подтверждения: {pending}"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
@@ -502,6 +510,96 @@ async def cmd_thinking(message: Message, command: CommandObject) -> None:
             "или <code>/thinking</code> (статус).",
             parse_mode=ParseMode.HTML,
         )
+
+
+@router.message(Command("tools"))
+async def cmd_tools(message: Message, command: CommandObject) -> None:
+    """Toggle the tool-call breadcrumb list above the answer.
+
+    Off (default) — ответ приходит без списка «🔧 Bash: …». Живой
+    индикатор работы это не трогает: heartbeat-сообщение «⏳ 30с — 🔧 …»
+    по-прежнему показывает текущий шаг и удаляется в конце хода.
+    """
+    sess = get_or_create_session(message.chat.id, message.bot)  # type: ignore[arg-type]
+    arg = (command.args or "").strip().lower()
+
+    if not arg or arg == "status":
+        state = "вкл" if sess.state.tools_visible else "выкл"
+        await message.answer(
+            f"🔧 Список команд над ответом: <b>{state}</b>\n\n"
+            "Переключить:\n"
+            "<code>/tools on</code> — показывать, что я запускал\n"
+            "<code>/tools off</code> — прятать (default)\n\n"
+            "<i>Строка «⏳ работаю… 🔧 …» во время хода остаётся в любом "
+            "случае — она удаляется сама.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if arg in {"on", "true", "1", "yes"}:
+        await sess.set_tools_visible(True)
+        await message.answer(
+            "🔧 Теперь над ответом будет список последних команд. "
+            "Шумно — <code>/tools off</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+    elif arg in {"off", "false", "0", "no"}:
+        await sess.set_tools_visible(False)
+        await message.answer("🔧 Список команд скрыт. В чате — только ответ.")
+    else:
+        await message.answer(
+            "Не понял. <code>/tools on</code>, <code>/tools off</code>, "
+            "или <code>/tools</code> (статус).",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+_EFFORT_LABELS = {
+    "low": "⚡ low — почти без обдумывания, максимально быстро",
+    "medium": "🚶 medium — умеренно",
+    "high": "🧠 high — глубоко",
+    "xhigh": "🔬 xhigh — очень глубоко (между high и max)",
+    "max": "🐢 max — максимум, самый медленный",
+}
+
+
+@router.message(Command("effort"))
+async def cmd_effort(message: Message, command: CommandObject) -> None:
+    """Set thinking depth for this chat (CLI ``--effort``).
+
+    Costs a subprocess reconnect (the flag is baked into launch), but
+    the session_id is resumed so no context is lost.
+    """
+    sess = get_or_create_session(message.chat.id, message.bot)  # type: ignore[arg-type]
+    arg = (command.args or "").strip().lower()
+
+    if not arg or arg == "status":
+        current = _EFFORT_LABELS.get(sess.state.effort, sess.state.effort)
+        options = "\n".join(
+            f"<code>/effort {lvl}</code> — {_EFFORT_LABELS[lvl].split(' — ', 1)[1]}"
+            for lvl in VALID_EFFORT_LEVELS
+        )
+        await message.answer(
+            f"🧠 Сейчас: <b>{html.escape(current)}</b>\n\n{options}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if arg not in VALID_EFFORT_LEVELS:
+        await message.answer(
+            "Не понял уровень. Доступно: "
+            + ", ".join(f"<code>{lvl}</code>" for lvl in VALID_EFFORT_LEVELS),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await sess.set_effort(arg)
+    await message.answer(
+        f"🧠 Effort: <b>{html.escape(_EFFORT_LABELS[arg])}</b>\n\n"
+        "Применится со следующего сообщения — процесс Claude "
+        "перезапустится, контекст сессии сохранится.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(Command("reset"))
@@ -912,7 +1010,7 @@ async def on_text(message: Message) -> None:
         "query_done",
         chat_id=message.chat.id,
         text_chars=len(reply.text),
-        tools=len(reply.tool_calls),
+        tools=reply.tool_count,
         cancelled=reply.cancelled,
         error=bool(reply.error),
     )
@@ -1120,7 +1218,9 @@ async def _send_reply(bot: Bot, chat_id: int, reply: StreamedReply) -> None:
     # sending so the user sees actual formatting instead of asterisks.
     body = md_to_html(reply.text.strip())
     if reply.tool_calls:
-        # Brief activity log above the answer body.
+        # Brief activity log above the answer body. Список приходит
+        # заполненным только когда чат включил ``/tools on`` — иначе
+        # ``_collect_reply`` его не копит (см. claude_session).
         head = "\n".join(reply.tool_calls[-12:])  # last 12 are enough
         body = f"<i>{html.escape(head)}</i>\n\n{body}" if body else f"<i>{html.escape(head)}</i>"
 
@@ -1168,6 +1268,15 @@ async def _send_reply(bot: Bot, chat_id: int, reply: StreamedReply) -> None:
             await bot.send_photo(chat_id, FSInputFile(str(path)))
         except Exception as e:  # noqa: BLE001
             log.debug("auto_send_image_failed", path=str(path), error=str(e))
+
+    # Auto-attach non-image documents Claude mentions (markdown notes,
+    # logs, CSV dumps, generated reports, etc.). Whitelist of extensions
+    # + safe project roots so we don't accidentally ship /etc/shadow.
+    for path in _extract_document_paths(reply.text):
+        try:
+            await bot.send_document(chat_id, FSInputFile(str(path)))
+        except Exception as e:  # noqa: BLE001
+            log.debug("auto_send_document_failed", path=str(path), error=str(e))
 
 
 # Image-path regex. Three flavors:
@@ -1265,6 +1374,58 @@ def _extract_image_paths(text: str) -> list[Path]:
             if (root / match).is_file():
                 break
 
+    return out
+
+
+# Whitelist of doc extensions the auto-attacher will ship. Kept narrow:
+# text-like formats + a few common bundle types the user asks for by
+# name ("скинь мне такой-то md"). No `.py`/`.sh`/`.env` — those are
+# either meant to stay in repo or contain secrets.
+_DOC_EXT_RE = (
+    r"(?:md|txt|log|csv|tsv|json|jsonl|yaml|yml|html|pdf|zip|"
+    r"tar|tar\.gz|tgz|xlsx|docx)"
+)
+
+# Absolute doc paths under safe roots. Same idea as image regex — only
+# accept paths we're comfortable exposing (project checkouts, /tmp,
+# bot state dir). No arbitrary /etc/... or /root/... reads.
+_ABS_DOC_PATH_RE = re.compile(
+    r"(?<![\w/])"
+    r"(/(?:tmp|var/lib/slothunter-dev-bot|"
+    r"opt/slot-hunter|opt/slothunter-dev-bot)"
+    rf"/[^\s\"'<>`]+\.{_DOC_EXT_RE})",
+    re.IGNORECASE,
+)
+
+
+def _extract_document_paths(text: str) -> list[Path]:
+    """Find non-image doc paths Claude mentioned and ship as documents.
+
+    Complements ``_extract_image_paths``: same safe-root discipline,
+    but for markdown notes, logs, CSVs, PDFs, zips, etc. Cap at 5 to
+    prevent runaway output from spamming the chat.
+    """
+    if not text:
+        return []
+    seen: set[str] = set()
+    out: list[Path] = []
+    for match in _ABS_DOC_PATH_RE.findall(text):
+        if match in seen:
+            continue
+        seen.add(match)
+        p = Path(match)
+        if not p.is_file():
+            continue
+        # Telegram bot API caps documents at 50 MB — skip anything
+        # bigger and let the user pull it manually.
+        try:
+            if p.stat().st_size > 45 * 1024 * 1024:
+                continue
+        except OSError:
+            continue
+        out.append(p)
+        if len(out) >= 5:
+            break
     return out
 
 

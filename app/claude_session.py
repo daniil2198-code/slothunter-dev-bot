@@ -56,6 +56,13 @@ log = get_logger(__name__)
 # binary, but the SDK supports it if a future command needs it.
 VALID_PERMISSION_MODES = ("default", "bypassPermissions", "acceptEdits", "plan")
 
+# Thinking-depth levels, passed straight through to the Claude Code CLI
+# as ``--effort <level>``. The SDK's type hint only lists four, but the
+# CLI accepts ``xhigh`` too (it sits between high and max) — the SDK
+# doesn't validate, it just forwards the string, so we allow all five.
+VALID_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+DEFAULT_EFFORT = "xhigh"
+
 
 @dataclass
 class ChatState:
@@ -72,6 +79,16 @@ class ChatState:
     # as a separate "💭" message (truncated to keep the chat readable).
     # Off by default — most turns it's noise.
     thinking_visible: bool = False
+    # When true, the answer carries a breadcrumb list of tool calls
+    # («🔧 Bash: …») above the body. Off by default: на длинном ходе это
+    # десяток строк сырых команд перед ответом — шум, который владелец
+    # пролистывает, чтобы добраться до смысла. Живой индикатор работы
+    # остаётся в heartbeat-сообщении «⏳ 30с — 🔧 …», оно само удаляется.
+    tools_visible: bool = False
+    # How hard the model thinks before answering. Unlike the two toggles
+    # above this one is baked into the CLI invocation, so changing it
+    # forces a client reconnect (session_id is resumed, context kept).
+    effort: str = DEFAULT_EFFORT
 
     @classmethod
     def load(cls, chat_id: int) -> ChatState:
@@ -87,12 +104,18 @@ class ChatState:
         if mode not in VALID_PERMISSION_MODES:
             log.warning("bad_permission_mode_in_state", mode=mode, fallback="default")
             mode = "default"
+        effort = data.get("effort") or DEFAULT_EFFORT
+        if effort not in VALID_EFFORT_LEVELS:
+            log.warning("bad_effort_in_state", effort=effort, fallback=DEFAULT_EFFORT)
+            effort = DEFAULT_EFFORT
         return cls(
             chat_id=chat_id,
             session_id=data.get("session_id"),
             cwd=Path(data.get("cwd") or settings.default_workdir),
             permission_mode=mode,
             thinking_visible=bool(data.get("thinking_visible") or False),
+            tools_visible=bool(data.get("tools_visible") or False),
+            effort=effort,
         )
 
     def save(self) -> None:
@@ -106,6 +129,8 @@ class ChatState:
                     "cwd": str(self.cwd),
                     "permission_mode": self.permission_mode,
                     "thinking_visible": self.thinking_visible,
+                    "tools_visible": self.tools_visible,
+                    "effort": self.effort,
                 },
                 ensure_ascii=False,
             ),
@@ -130,7 +155,11 @@ class StreamedReply:
     """
 
     text: str = ""
+    # Breadcrumb labels for the chat. Пусто, когда ``tools_visible``
+    # выключен — счётчик ниже всё равно считает, чтобы наблюдаемость в
+    # логе не зависела от настройки показа.
     tool_calls: list[str] = field(default_factory=list)
+    tool_count: int = 0
     session_id: str | None = None
     error: str | None = None
     cancelled: bool = False
@@ -266,6 +295,39 @@ class ChatSession:
             value=self.state.thinking_visible,
         )
 
+    async def set_tools_visible(self, value: bool) -> None:
+        """Toggle the tool-call breadcrumb list above the answer body.
+        Читается при сборке ответа, клиент не пересоздаётся."""
+        async with self._lock:
+            self.state.tools_visible = bool(value)
+            self.state.save()
+        log.info(
+            "tools_visible_changed",
+            chat_id=self.chat_id,
+            value=self.state.tools_visible,
+        )
+
+    async def set_effort(self, level: str) -> bool:
+        """Change thinking depth (``--effort`` on the CLI).
+
+        Unlike the permission / thinking toggles this one can't be read
+        lazily: it's a launch flag of the underlying Claude Code
+        process. So we drop the client and let the next query rebuild
+        it. ``session_id`` stays on disk, the SDK resumes it — the
+        conversation isn't lost, only the subprocess is recycled.
+        """
+        if level not in VALID_EFFORT_LEVELS:
+            log.warning("set_effort_rejected", level=level)
+            return False
+        async with self._lock:
+            if self.state.effort == level:
+                return True
+            self.state.effort = level
+            self.state.save()
+            await self._close_client()
+        log.info("effort_changed", chat_id=self.chat_id, level=level)
+        return True
+
     async def seed_with_summary(self, summary: str) -> None:
         """Start a fresh session pre-loaded with a previous-session
         summary so Claude has the context.
@@ -320,6 +382,11 @@ class ChatSession:
         }
         if settings.model:
             opts["model"] = settings.model
+        # Effort is forwarded verbatim as ``--effort`` to the CLI. Kept
+        # per-chat so the operator can dial it down for routine smoke
+        # runs and back up for gnarly debugging without a restart.
+        if self.state.effort:
+            opts["effort"] = self.state.effort
         if settings.betas:
             opts["betas"] = settings.betas
 
@@ -378,7 +445,13 @@ class ChatSession:
                             thinking_chunks.append(block.thinking)
                     elif isinstance(block, ToolUseBlock):
                         label = _format_tool_call(block)
-                        out.tool_calls.append(label)
+                        out.tool_count += 1
+                        # Хлебные крошки в тексте ответа — по согласию
+                        # чата (/tools on). Прогресс отдаём всегда: он
+                        # живёт в heartbeat-сообщении, которое удаляется
+                        # по окончании хода и чат не засоряет.
+                        if self.state.tools_visible:
+                            out.tool_calls.append(label)
                         if on_progress is not None:
                             # Fire-and-forget: never let TG hiccups stall
                             # the SDK stream.
