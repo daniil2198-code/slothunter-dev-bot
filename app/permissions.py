@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import html
 import json
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -446,32 +447,42 @@ class PermissionBroker:
 #
 # Each match falls back to the broker prompt, so the user can still
 # explicitly OK it if they really meant to.
+# Подстрокой ловим только то, что само по себе однозначно: у этих
+# шаблонов нет безобидных продолжений.
 CATASTROPHIC_BASH_PATTERNS = (
-    "rm -rf /",
-    "rm -rf /*",
-    "rm -rf ~",
-    "rm -rf $HOME",
-    "rm -rf /etc",
-    "rm -rf /var",
-    "rm -rf /root",
-    "rm -rf /home",
     "dd if=/dev/zero of=/dev/",
     "dd if=/dev/random of=/dev/",
-    "mkfs",
-    "fdisk",
-    "wipefs",
     ":(){:|:&};:",  # forkbomb (compact form)
     ": ( ) { :|:& };:",  # forkbomb (spaced)
-    "shutdown",
-    "reboot",
-    "halt",
-    "poweroff",
     "iptables -F",
     "ufw disable",
-    "userdel",
     "passwd root",
-    "chmod -R 000 /",
-    "chmod 000 /",
+)
+
+# А вот «rm -rf /» подстрокой ловить НЕЛЬЗЯ: он сидит внутри любого
+# «rm -rf /tmp/что-угодно». 17.10 так сработали три ложных стопа на
+# уборке временного каталога; два никто не успел подтвердить за 120
+# секунд — команды молча отклонились, а владелец спросил, почему снова
+# «выскакивают» вопросы, хотя YOLO включён. Ложное срабатывание здесь не
+# «лишнее нажатие»: в Telegram оно будит человека, а без ответа — роняет
+# работу.
+#
+# Поэтому опасная цель должна быть ЦЕЛИКОМ: «/», «/*», «~», «$HOME» или
+# корень системного каталога — и дальше конец слова. «rm -rf /var» —
+# стоп; «rm -rf /var/tmp/x» — нет.
+_END = r"(?=$|[\s;&|)`])"
+_RM_RF_TARGET = re.compile(
+    r"\brm\s+(?:-[a-zA-Z]*[rR][a-zA-Z]*\s+|--recursive\s+|-f\s+)+(?:--\s+)?"
+    r"(?:/\*?|~/?|\$HOME/?|\$\{HOME\}/?|/(?:etc|var|root|home|usr|boot|bin|sbin|lib|opt)/?)"
+    + _END
+)
+_CHMOD_ROOT = re.compile(r"\bchmod\s+(?:-R\s+)?0*00\s+/" + _END)
+# Команды-слова — только в позиции команды (начало, после ; & | ( ` $( ,
+# через sudo/systemctl), иначе «grep -n on_shutdown» будил бы владельца.
+_DANGER_CMD = re.compile(
+    r"(?:^|[;&|(`]|\$\()\s*(?:sudo\s+)?(?:systemctl\s+)?"
+    r"(?:shutdown|reboot|halt|poweroff|userdel|mkfs(?:\.\w+)?|fdisk|wipefs)"
+    + _END
 )
 
 
@@ -479,13 +490,17 @@ def is_catastrophic_bash(command: str) -> bool:
     """True if the command matches a "never auto-run" pattern.
 
     Used by the YOLO path: we trust Claude on everything *except* this.
-    Substring match — paranoid by design, false positives just mean an
-    extra approval tap.
+    Ложное срабатывание не бесплатно (см. выше), поэтому опасная цель
+    проверяется целиком, а команды-слова — в позиции команды.
     """
     cmd = command.strip()
     if not cmd:
         return False
-    return any(p in cmd for p in CATASTROPHIC_BASH_PATTERNS)
+    if any(p in cmd for p in CATASTROPHIC_BASH_PATTERNS):
+        return True
+    return bool(
+        _RM_RF_TARGET.search(cmd) or _CHMOD_ROOT.search(cmd) or _DANGER_CMD.search(cmd)
+    )
 
 
 CanUseToolCallback = Callable[

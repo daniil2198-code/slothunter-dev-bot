@@ -398,7 +398,13 @@ class ChatSession:
                 "playwright": {
                     "type": "stdio",
                     "command": "npx",
-                    "args": ["-y", "@playwright/mcp@latest", "--headless"],
+                    # --no-sandbox: бот живёт под root, а Chrome под root
+                    # без него не стартует вовсе (17.10: «Running as root
+                    # without --no-sandbox is not supported» — все
+                    # browser_* падали ещё до первой страницы). @latest
+                    # однажды уже сменил браузер под нами; если сломается
+                    # снова — закрепить версию (на 17.10 — 0.0.83).
+                    "args": ["-y", "@playwright/mcp@latest", "--headless", "--no-sandbox"],
                 }
             }
             log.info("playwright_mcp_enabled")
