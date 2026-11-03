@@ -17,8 +17,11 @@ Format:
   ``.done`` (auditable trail). Errors → ``.failed`` so we can retry by
   hand if needed.
 
-Currently the only producer is ``slot-hunter/scripts/deploy.sh`` which
-writes ``/test mini-app-home-loads`` after a successful prod deploy.
+Producers:
+- ``slot-hunter/scripts/deploy.sh`` writes ``/test mini-app-home-loads``
+  after a successful prod deploy (only with ``POST_DEPLOY_SMOKE=1``);
+- ``slot-hunter/scripts/routines/daily_audit_trigger.sh`` (cron 12:20
+  Minsk) — the daily «аудит за сутки» routine, slot-hunter #0158.
 """
 
 from __future__ import annotations
