@@ -15,7 +15,8 @@ Format:
 - The scheduler invokes ``process_pending_triggers(bot)`` once a minute.
   Each .txt is processed in lexicographic order, then renamed to
   ``.done`` (auditable trail). Errors → ``.failed`` so we can retry by
-  hand if needed.
+  hand if needed. Telegram unreachable before the run starts → the
+  ``.txt`` stays and is retried every minute, up to 3 hours.
 
 Producers:
 - ``slot-hunter/scripts/deploy.sh`` writes ``/test mini-app-home-loads``
@@ -26,7 +27,9 @@ Producers:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -37,7 +40,41 @@ from app.logging import get_logger
 if TYPE_CHECKING:
     from aiogram import Bot
 
+    from app.claude_session import StreamedReply
+
 log = get_logger(__name__)
+
+# Telegram лежит — задание ждёт, а не сгорает. 08.11 в 12:19–12:21 Bot API
+# отвечал Bad Gateway; рутина «аудит за сутки» пришла в 12:20, приветствие
+# не отправилось, и файл ушёл в .failed без единой повторной попытки.
+# Пока приветствие не ушло, Claude не запускаем (ответ всё равно некуда
+# доставить) и оставляем .txt на месте — следующий проход через минуту.
+# Сдаёмся, когда заданию столько: суточной рутине и через три часа ещё
+# есть смысл, а вечная очередь прятала бы поломку.
+_DEFER_MAX_AGE_S = 3 * 3600
+# Ответ, ради которого Claude уже отработал, не теряем из-за минутного
+# сбоя Telegram: повторяем отправку. Дубль куска лучше потери отчёта.
+_REPLY_RETRY_DELAYS_S: tuple[float, ...] = (20.0, 60.0)
+
+
+def _age_s(path: Path) -> float:
+    """Сколько файл лежит в очереди. Не прочитать — «бесконечно»."""
+    try:
+        return time.time() - path.stat().st_mtime
+    except OSError:
+        return float("inf")
+
+
+async def _send_reply_retrying(bot: Bot, chat_id: int, reply: StreamedReply) -> None:
+    for delay in (*_REPLY_RETRY_DELAYS_S, None):
+        try:
+            await _send_reply(bot, chat_id, reply)
+            return
+        except Exception as e:
+            if delay is None:
+                raise
+            log.warning("trigger_reply_retry", error=str(e)[:200], delay_s=delay)
+            await asyncio.sleep(delay)
 
 
 def _trigger_dir() -> Path:
@@ -102,6 +139,17 @@ async def process_pending_triggers(bot: Bot) -> None:
                 f"🤖 <i>авто-триггер: {first_line[:200]}</i>",
                 parse_mode="HTML",
             )
+        except Exception as e:  # noqa: BLE001 — Telegram недоступен
+            age = _age_s(path)
+            if age < _DEFER_MAX_AGE_S:
+                log.warning(
+                    "trigger_deferred", path=str(path), error=str(e)[:200], age_s=int(age)
+                )
+                continue  # .txt остаётся — повтор на следующем проходе
+            log.error("trigger_gave_up", path=str(path), error=str(e)[:200], age_s=int(age))
+            _mark_failed(path)
+            continue
+        try:
             sess = get_or_create_session(chat_id, bot)
             # If the trigger is a slash-command we know how to handle
             # natively (e.g. ``/test mini-app-home-loads``), translate
@@ -111,7 +159,7 @@ async def process_pending_triggers(bot: Bot) -> None:
             # with "Unknown command: /test".
             prompt = _translate_slash_command(first_line) or text
             reply = await sess.query(prompt)
-            await _send_reply(bot, chat_id, reply)
+            await _send_reply_retrying(bot, chat_id, reply)
         except Exception as e:  # noqa: BLE001 — never crash the scheduler
             log.exception("trigger_failed", path=str(path), error=str(e))
             _mark_failed(path)
